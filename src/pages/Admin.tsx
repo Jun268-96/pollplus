@@ -6,9 +6,11 @@ import type {
   AdminQuestion,
   NewQuestionInput,
   QuestionOption,
+  QuestionPatch,
   QuestionType,
   ResponseItem,
   ServerMessage,
+  SubmissionMode,
 } from '../../shared/types';
 
 interface AdminView {
@@ -31,6 +33,12 @@ function isChoiceType(type: QuestionType): type is 'multiple_choice' | 'quiz' {
 function newOptionId() {
   return crypto.randomUUID();
 }
+
+const SUBMISSION_LABEL: Record<SubmissionMode, string> = {
+  single: '1회 제출',
+  multiple: '여러 번 제출',
+  replace: '답 변경',
+};
 
 function formatElapsed(ms: number): string {
   const totalSec = Math.max(0, Math.floor(ms / 1000));
@@ -521,12 +529,19 @@ function AddQuestionForm(props: { onCancel: () => void; onSubmit: (input: NewQue
     { id: newOptionId(), text: '' },
   ]);
   const [correctOptionId, setCorrectOptionId] = useState<string>('');
+  const [submissionMode, setSubmissionMode] = useState<SubmissionMode>('single');
+  const [maxSubmissions, setMaxSubmissions] = useState(3);
 
   const choiceType = isChoiceType(type);
 
   const submit = () => {
     if (!prompt.trim()) return;
-    const input: NewQuestionInput = { type, prompt: prompt.trim() };
+    const input: NewQuestionInput = {
+      type,
+      prompt: prompt.trim(),
+      submissionMode,
+      maxSubmissions: submissionMode === 'multiple' ? maxSubmissions : 1,
+    };
     if (choiceType) {
       const cleaned = options.filter((o) => o.text.trim().length > 0);
       if (cleaned.length < 2) return;
@@ -563,6 +578,13 @@ function AddQuestionForm(props: { onCancel: () => void; onSubmit: (input: NewQue
         placeholder="질문 내용을 입력하세요"
         rows={2}
         className="w-full rounded-lg border border-bento-border px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-bento-accent"
+      />
+
+      <SubmissionPolicyFields
+        mode={submissionMode}
+        maxSubmissions={maxSubmissions}
+        onModeChange={setSubmissionMode}
+        onMaxChange={setMaxSubmissions}
       />
 
       {choiceType && (
@@ -643,6 +665,49 @@ function OptionsEditor(props: {
   );
 }
 
+function SubmissionPolicyFields(props: {
+  mode: SubmissionMode;
+  maxSubmissions: number;
+  onModeChange: (mode: SubmissionMode) => void;
+  onMaxChange: (value: number) => void;
+}) {
+  const { mode, maxSubmissions, onModeChange, onMaxChange } = props;
+  return (
+    <div className="rounded-lg border border-bento-border bg-bento-bg p-3 flex flex-col gap-2">
+      <div className="flex items-center justify-between gap-3">
+        <label className="text-xs font-semibold text-bento-muted">응답 방식</label>
+        <select
+          value={mode}
+          onChange={(e) => onModeChange(e.target.value as SubmissionMode)}
+          className="rounded-md border border-bento-border bg-bento-surface px-2 py-1.5 text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-bento-accent"
+        >
+          {(Object.keys(SUBMISSION_LABEL) as SubmissionMode[]).map((value) => (
+            <option key={value} value={value}>{SUBMISSION_LABEL[value]}</option>
+          ))}
+        </select>
+      </div>
+      {mode === 'multiple' && (
+        <label className="flex items-center justify-between gap-3 text-xs text-bento-muted">
+          연결당 최대 제출 횟수
+          <input
+            type="number"
+            min={2}
+            max={20}
+            value={maxSubmissions}
+            onChange={(e) => onMaxChange(Math.max(2, Math.min(20, Number(e.target.value) || 2)))}
+            className="w-16 rounded-md border border-bento-border bg-bento-surface px-2 py-1 text-right text-xs focus:outline-none focus:ring-2 focus:ring-bento-accent"
+          />
+        </label>
+      )}
+      <p className="text-[11px] leading-relaxed text-bento-muted">
+        {mode === 'single' && '한 번 제출하면 같은 연결에서는 다시 낼 수 없어요.'}
+        {mode === 'multiple' && '응답마다 1.2초 간격을 두며, 설정한 횟수까지 집계에 모두 더해져요.'}
+        {mode === 'replace' && '다시 제출하면 같은 연결에서 낸 이전 답을 새 답으로 바꿔요.'}
+      </p>
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // 문항 편집 (선택된 문항 — 활성 문항이면 구조 편집 잠금)
 // ---------------------------------------------------------------------------
@@ -650,7 +715,7 @@ function OptionsEditor(props: {
 function QuestionEditor(props: {
   question: AdminQuestion | null;
   isActive: boolean;
-  onSave: (patch: { prompt?: string; options?: QuestionOption[]; correctOptionId?: string }) => void;
+  onSave: (patch: QuestionPatch) => void;
 }) {
   const { question, isActive, onSave } = props;
   const [prompt, setPrompt] = useState(question?.prompt ?? '');
@@ -658,6 +723,8 @@ function QuestionEditor(props: {
   const [correctOptionId, setCorrectOptionId] = useState<string>(
     question?.type === 'quiz' ? question.correctOptionId : '',
   );
+  const [submissionMode, setSubmissionMode] = useState<SubmissionMode>(question?.submissionMode ?? 'single');
+  const [maxSubmissions, setMaxSubmissions] = useState(question?.maxSubmissions ?? 1);
 
   if (!question) {
     return (
@@ -676,6 +743,12 @@ function QuestionEditor(props: {
   const saveOptions = () => {
     const cleaned = options.filter((o) => o.text.trim().length > 0);
     if (cleaned.length >= 2) onSave({ options: cleaned, correctOptionId: question.type === 'quiz' ? correctOptionId : undefined });
+  };
+  const saveSubmissionPolicy = () => {
+    const nextMax = submissionMode === 'multiple' ? maxSubmissions : 1;
+    if (submissionMode !== question.submissionMode || nextMax !== question.maxSubmissions) {
+      onSave({ submissionMode, maxSubmissions: nextMax });
+    }
   };
 
   return (
@@ -696,6 +769,23 @@ function QuestionEditor(props: {
         rows={2}
         className="w-full rounded-lg border border-bento-border px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-bento-accent"
       />
+
+      <fieldset disabled={structureLocked} className="disabled:opacity-50">
+        <SubmissionPolicyFields
+          mode={submissionMode}
+          maxSubmissions={maxSubmissions}
+          onModeChange={setSubmissionMode}
+          onMaxChange={setMaxSubmissions}
+        />
+        <button
+          type="button"
+          onClick={saveSubmissionPolicy}
+          disabled={structureLocked}
+          className="mt-2 text-xs font-semibold px-3 py-1.5 rounded-lg bg-bento-accent text-white disabled:opacity-40"
+        >
+          응답 방식 저장
+        </button>
+      </fieldset>
 
       {choiceType && (
         <fieldset disabled={structureLocked} className="disabled:opacity-50">

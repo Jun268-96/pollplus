@@ -2,6 +2,7 @@
 // DOM/Workers 전용 전역 타입에 의존하지 않는 순수 TS 타입만 둔다.
 
 export type QuestionType = 'multiple_choice' | 'open_text' | 'word_cloud' | 'quiz';
+export type SubmissionMode = 'single' | 'multiple' | 'replace';
 
 export interface QuestionOption {
   id: string;
@@ -16,6 +17,10 @@ interface QuestionCommon {
   accepting: boolean;
   /** TV(viewer)에 집계를 공개했는가 — blind 토글 */
   resultsVisible: boolean;
+  /** 한 연결이 이 문항에 응답하는 방식 */
+  submissionMode: SubmissionMode;
+  /** multiple 모드에서 한 연결이 낼 수 있는 최대 응답 수 */
+  maxSubmissions: number;
 }
 
 /** 관리자(admin)만 보는 전체 문항 — 퀴즈 정답 포함 */
@@ -86,12 +91,16 @@ export interface NewQuestionInput {
   prompt: string;
   options?: QuestionOption[]; // multiple_choice / quiz
   correctOptionId?: string; // quiz
+  submissionMode?: SubmissionMode;
+  maxSubmissions?: number;
 }
 
 export type QuestionPatch = Partial<{
   prompt: string;
   options: QuestionOption[];
   correctOptionId: string;
+  submissionMode: SubmissionMode;
+  maxSubmissions: number;
 }>;
 
 // ---------------------------------------------------------------------------
@@ -148,8 +157,10 @@ export type ServerMessage =
       type: 'submit_ack';
       questionId: string;
       ok: boolean;
-      reason?: 'not_active' | 'not_accepting' | 'duplicate' | 'invalid';
+      reason?: 'not_active' | 'not_accepting' | 'duplicate' | 'limit_reached' | 'cooldown' | 'invalid';
       quiz?: { correct: boolean; correctOptionId: string };
+      submissionCount?: number;
+      submissionLimit?: number;
     }
   | { type: 'error'; reason: string };
 

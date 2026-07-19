@@ -11,6 +11,7 @@ import type {
   Role,
   ServerMessage,
   PublicStateMessage,
+  SubmissionMode,
   ViewerAggregate,
 } from '../shared/types';
 import { toPublicQuestion } from '../shared/types';
@@ -40,6 +41,8 @@ interface QuestionRow {
   position: number;
   accepting: number;
   results_visible: number;
+  submission_mode: string;
+  max_submissions: number;
 }
 
 interface ResponseRow {
@@ -67,13 +70,21 @@ interface QuestionIdRow {
   question_id: string;
 }
 
+interface ColumnInfoRow {
+  [key: string]: SqlStorageValue;
+  name: string;
+}
+
 /** WebSocket 연결(소켓)마다 serializeAttachment로 저장하는 메타데이터.
  *  참여자 쪽엔 아무것도 저장하지 않는 대신(계획서 "참여자 클라이언트 = 무캐싱 거울"),
  *  중복 제출 방지는 서버가 이 연결 자체에 붙여서 관리한다. */
 interface SocketAttachment {
   role: Role;
   socketTag: string;
-  answered: Record<string, boolean>;
+  /** v1 attachment와 호환하기 위해 optional로 유지한다. */
+  answered?: Record<string, boolean>;
+  submissions?: Record<string, number>;
+  lastSubmittedAt?: Record<string, number>;
 }
 
 const MAX_QUESTIONS = 100;
@@ -82,6 +93,27 @@ const MAX_PROMPT_LENGTH = 1_000;
 const MAX_OPTION_TEXT_LENGTH = 200;
 const MAX_OPTIONS = 10;
 const MAX_RESPONSE_TEXT_LENGTH = 1_000;
+const MAX_MULTIPLE_SUBMISSIONS = 20;
+const MULTIPLE_SUBMISSION_COOLDOWN_MS = 1_200;
+
+function isSubmissionMode(value: unknown): value is SubmissionMode {
+  return value === 'single' || value === 'multiple' || value === 'replace';
+}
+
+function isSubmissionLimit(value: unknown): value is number {
+  return Number.isInteger(value) && typeof value === 'number' && value >= 2 && value <= MAX_MULTIPLE_SUBMISSIONS;
+}
+
+function resolveSubmissionSettings(
+  modeValue: unknown,
+  limitValue: unknown,
+): { submissionMode: SubmissionMode; maxSubmissions: number } | null {
+  const submissionMode = modeValue === undefined ? 'single' : isSubmissionMode(modeValue) ? modeValue : null;
+  if (!submissionMode) return null;
+  if (submissionMode !== 'multiple') return { submissionMode, maxSubmissions: 1 };
+  if (limitValue === undefined) return { submissionMode, maxSubmissions: 3 };
+  return isSubmissionLimit(limitValue) ? { submissionMode, maxSubmissions: limitValue } : null;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -125,7 +157,11 @@ function parseClientMessage(value: unknown): ClientMessage | null {
       const input = value.input;
       if (!isText(input.prompt, MAX_PROMPT_LENGTH)) return null;
       const { type, prompt } = input;
-      if (type === 'open_text' || type === 'word_cloud') return { type: 'add_question', input: { type, prompt: prompt.trim() } };
+      const submission = resolveSubmissionSettings(input.submissionMode, input.maxSubmissions);
+      if (!submission) return null;
+      if (type === 'open_text' || type === 'word_cloud') {
+        return { type: 'add_question', input: { type, prompt: prompt.trim(), ...submission } };
+      }
       if ((type === 'multiple_choice' || type === 'quiz') && isOptions(input.options)) {
         if (type === 'quiz' && (!isId(input.correctOptionId) || !input.options.some((o) => o.id === input.correctOptionId))) return null;
         return {
@@ -134,6 +170,7 @@ function parseClientMessage(value: unknown): ClientMessage | null {
             type,
             prompt: prompt.trim(),
             options: input.options,
+            ...submission,
             ...(type === 'quiz' ? { correctOptionId: input.correctOptionId as string } : {}),
           },
         };
@@ -154,6 +191,14 @@ function parseClientMessage(value: unknown): ClientMessage | null {
       if ('correctOptionId' in value.patch) {
         if (!isId(value.patch.correctOptionId)) return null;
         patch.correctOptionId = value.patch.correctOptionId;
+      }
+      if ('submissionMode' in value.patch) {
+        if (!isSubmissionMode(value.patch.submissionMode)) return null;
+        patch.submissionMode = value.patch.submissionMode;
+      }
+      if ('maxSubmissions' in value.patch) {
+        if (!isSubmissionLimit(value.patch.maxSubmissions)) return null;
+        patch.maxSubmissions = value.patch.maxSubmissions;
       }
       if (Object.keys(patch).length === 0) return null;
       return { type: 'update_question', questionId: value.questionId, patch };
@@ -206,7 +251,9 @@ export class PollRoom extends DurableObject<Env> {
           correct_option_id TEXT,
           position INTEGER NOT NULL,
           accepting INTEGER NOT NULL DEFAULT 0,
-          results_visible INTEGER NOT NULL DEFAULT 1
+          results_visible INTEGER NOT NULL DEFAULT 1,
+          submission_mode TEXT NOT NULL DEFAULT 'single',
+          max_submissions INTEGER NOT NULL DEFAULT 1
         )
       `);
       ctx.storage.sql.exec(`
@@ -219,6 +266,16 @@ export class PollRoom extends DurableObject<Env> {
           created_at INTEGER NOT NULL
         )
       `);
+
+      // 이미 배포된 v1 설문의 SQLite 테이블도 안전하게 확장한다.
+      const questionColumns = ctx.storage.sql.exec<ColumnInfoRow>('PRAGMA table_info(questions)').toArray();
+      const columnNames = new Set(questionColumns.map((column) => column.name));
+      if (!columnNames.has('submission_mode')) {
+        ctx.storage.sql.exec("ALTER TABLE questions ADD COLUMN submission_mode TEXT NOT NULL DEFAULT 'single'");
+      }
+      if (!columnNames.has('max_submissions')) {
+        ctx.storage.sql.exec('ALTER TABLE questions ADD COLUMN max_submissions INTEGER NOT NULL DEFAULT 1');
+      }
     });
   }
 
@@ -272,7 +329,8 @@ export class PollRoom extends DurableObject<Env> {
     const attachment: SocketAttachment = {
       role,
       socketTag: crypto.randomUUID(),
-      answered: {},
+      submissions: {},
+      lastSubmittedAt: {},
     };
     server.serializeAttachment(attachment);
     this.ctx.acceptWebSocket(server, [role]);
@@ -306,6 +364,9 @@ export class PollRoom extends DurableObject<Env> {
 
     const attachment = ws.deserializeAttachment() as SocketAttachment | null;
     if (!attachment) return;
+    // 이전 배포본의 { answered } attachment가 hibernation 중 남아 있을 수 있다.
+    attachment.submissions ??= Object.fromEntries(Object.keys(attachment.answered ?? {}).map((questionId) => [questionId, 1]));
+    attachment.lastSubmittedAt ??= {};
 
     if (parsed.type === 'submit') {
       if (attachment.role !== 'participant') return;
@@ -367,13 +428,15 @@ export class PollRoom extends DurableObject<Env> {
     const id = crypto.randomUUID();
 
     this.ctx.storage.sql.exec(
-      'INSERT INTO questions (id, type, prompt, options, correct_option_id, position, accepting, results_visible) VALUES (?, ?, ?, ?, ?, ?, 0, 1)',
+      'INSERT INTO questions (id, type, prompt, options, correct_option_id, position, accepting, results_visible, submission_mode, max_submissions) VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?)',
       id,
       input.type,
       input.prompt,
       input.options ? JSON.stringify(input.options) : null,
       input.correctOptionId ?? null,
       position,
+      input.submissionMode ?? 'single',
+      input.submissionMode === 'multiple' ? input.maxSubmissions ?? 3 : 1,
     );
 
     this.broadcastAdminState();
@@ -385,11 +448,15 @@ export class PollRoom extends DurableObject<Env> {
     if (!question) return this.send(ws, { type: 'error', reason: 'question not found' });
 
     const isActive = poll.active_question_id === questionId;
-    const structuralChange = patch.options !== undefined || patch.correctOptionId !== undefined;
+    const structuralChange =
+      patch.options !== undefined ||
+      patch.correctOptionId !== undefined ||
+      patch.submissionMode !== undefined ||
+      patch.maxSubmissions !== undefined;
     if (isActive && structuralChange) {
       return this.send(ws, {
         type: 'error',
-        reason: '활성 문항의 선택지/정답은 편집할 수 없습니다. 먼저 다른 문항으로 전환하세요.',
+        reason: '진행 중인 문항의 선택지·정답·응답 방식은 편집할 수 없습니다. 먼저 다른 문항으로 전환하세요.',
       });
     }
 
@@ -398,12 +465,19 @@ export class PollRoom extends DurableObject<Env> {
       patch.options ?? ('options' in question ? question.options : undefined);
     const nextCorrect: string | undefined =
       patch.correctOptionId ?? (question.type === 'quiz' ? question.correctOptionId : undefined);
+    const nextSubmissionMode = patch.submissionMode ?? question.submissionMode;
+    const nextMaxSubmissions =
+      nextSubmissionMode === 'multiple'
+        ? patch.maxSubmissions ?? (question.submissionMode === 'multiple' ? question.maxSubmissions : 3)
+        : 1;
 
     this.ctx.storage.sql.exec(
-      'UPDATE questions SET prompt = ?, options = ?, correct_option_id = ? WHERE id = ?',
+      'UPDATE questions SET prompt = ?, options = ?, correct_option_id = ?, submission_mode = ?, max_submissions = ? WHERE id = ?',
       nextPrompt,
       nextOptions ? JSON.stringify(nextOptions) : null,
       nextCorrect ?? null,
+      nextSubmissionMode,
+      nextMaxSubmissions,
       questionId,
     );
 
@@ -478,7 +552,7 @@ export class PollRoom extends DurableObject<Env> {
   }
 
   // ---------------------------------------------------------------------
-  // 응답 제출: questionId·accepting·중복(소켓 기준)을 서버가 검증
+  // 응답 제출: questionId·accepting·응답 방식(소켓 기준)을 서버가 검증
   // ---------------------------------------------------------------------
 
   private handleSubmit(
@@ -490,13 +564,25 @@ export class PollRoom extends DurableObject<Env> {
     const poll = this.requirePoll();
     const question = this.getQuestion(questionId);
 
-    const reject = (reason: 'not_active' | 'not_accepting' | 'duplicate' | 'invalid') => {
+    const reject = (reason: 'not_active' | 'not_accepting' | 'duplicate' | 'limit_reached' | 'cooldown' | 'invalid') => {
       this.send(ws, { type: 'submit_ack', questionId, ok: false, reason });
     };
 
     if (!question || poll.active_question_id !== questionId) return reject('not_active');
     if (!question.accepting) return reject('not_accepting');
-    if (attachment.answered[questionId]) return reject('duplicate');
+
+    const submissions = attachment.submissions ?? {};
+    const currentCount = submissions[questionId] ?? 0;
+    const now = Date.now();
+    if (question.submissionMode === 'single' && currentCount > 0) return reject('duplicate');
+    if (question.submissionMode === 'multiple' && currentCount >= question.maxSubmissions) return reject('limit_reached');
+    if (
+      question.submissionMode === 'multiple' &&
+      currentCount > 0 &&
+      now - (attachment.lastSubmittedAt?.[questionId] ?? 0) < MULTIPLE_SUBMISSION_COOLDOWN_MS
+    ) {
+      return reject('cooldown');
+    }
 
     let quizFeedback: { correct: boolean; correctOptionId: string } | undefined;
 
@@ -523,6 +609,12 @@ export class PollRoom extends DurableObject<Env> {
       }
     }
 
+    // 답 변경은 같은 소켓이 낸 기존 답을 교체한다. moderation으로 숨긴 과거 답도
+    // 다시 살아나지 않도록 모두 지운 뒤 최신 한 건만 남긴다.
+    if (question.submissionMode === 'replace' && currentCount > 0) {
+      this.ctx.storage.sql.exec('DELETE FROM responses WHERE question_id = ? AND socket_tag = ?', questionId, attachment.socketTag);
+    }
+
     const id = crypto.randomUUID();
     this.ctx.storage.sql.exec(
       'INSERT INTO responses (id, question_id, socket_tag, payload, hidden, created_at) VALUES (?, ?, ?, ?, 0, ?)',
@@ -530,13 +622,23 @@ export class PollRoom extends DurableObject<Env> {
       questionId,
       attachment.socketTag,
       JSON.stringify(payload),
-      Date.now(),
+      now,
     );
 
-    attachment.answered[questionId] = true;
+    attachment.submissions = submissions;
+    attachment.lastSubmittedAt ??= {};
+    attachment.lastSubmittedAt[questionId] = now;
+    attachment.submissions[questionId] = question.submissionMode === 'multiple' ? currentCount + 1 : 1;
     ws.serializeAttachment(attachment);
 
-    this.send(ws, { type: 'submit_ack', questionId, ok: true, quiz: quizFeedback });
+    this.send(ws, {
+      type: 'submit_ack',
+      questionId,
+      ok: true,
+      quiz: quizFeedback,
+      submissionCount: attachment.submissions[questionId],
+      submissionLimit: question.submissionMode === 'multiple' ? question.maxSubmissions : 1,
+    });
     this.broadcastResults(questionId);
   }
 
@@ -556,12 +658,16 @@ export class PollRoom extends DurableObject<Env> {
   }
 
   private rowToQuestion(row: QuestionRow): AdminQuestion {
+    const submissionMode: SubmissionMode =
+      row.submission_mode === 'multiple' || row.submission_mode === 'replace' ? row.submission_mode : 'single';
     const base = {
       id: row.id,
       prompt: row.prompt,
       position: row.position,
       accepting: row.accepting === 1,
       resultsVisible: row.results_visible === 1,
+      submissionMode,
+      maxSubmissions: submissionMode === 'multiple' ? Math.max(2, Math.min(MAX_MULTIPLE_SUBMISSIONS, row.max_submissions)) : 1,
     };
     switch (row.type) {
       case 'multiple_choice':

@@ -18,6 +18,10 @@ function reasonText(reason?: string): string {
       return '이 문항은 마감되었어요.';
     case 'duplicate':
       return '이미 제출했어요.';
+    case 'limit_reached':
+      return '설정된 제출 횟수에 도달했어요.';
+    case 'cooldown':
+      return '잠시 후 다시 제출해주세요.';
     case 'invalid':
       return '제출값이 올바르지 않아요.';
     default:
@@ -35,6 +39,7 @@ export default function Participate() {
   const [submitState, setSubmitState] = useState<SubmitState>('idle');
   const [ackReason, setAckReason] = useState<string | undefined>(undefined);
   const [quizFeedback, setQuizFeedback] = useState<{ correct: boolean; correctOptionId: string } | null>(null);
+  const [submissionCount, setSubmissionCount] = useState(0);
 
   const prevQuestionIdRef = useRef<string | null>(null);
 
@@ -48,6 +53,7 @@ export default function Participate() {
         setSubmitState('idle');
         setAckReason(undefined);
         setQuizFeedback(null);
+        setSubmissionCount(0);
       }
       setView({ poll: msg.poll, activeQuestion: msg.activeQuestion });
       return;
@@ -60,6 +66,8 @@ export default function Participate() {
       if (msg.ok) {
         setSubmitState('done');
         setQuizFeedback(msg.quiz ?? null);
+        setSubmissionCount(msg.submissionCount ?? 1);
+        setText('');
       } else {
         setSubmitState('error');
         setAckReason(msg.reason);
@@ -70,7 +78,10 @@ export default function Participate() {
   const { status, send } = usePollSocket(pollId, 'participant', { onMessage: handleMessage });
 
   const question = view.activeQuestion;
-  const locked = submitState === 'sending' || submitState === 'done';
+  const locked =
+    submitState === 'sending' ||
+    (question?.submissionMode === 'single' && submitState === 'done') ||
+    (question?.submissionMode === 'multiple' && submissionCount >= question.maxSubmissions);
 
   const submitChoice = (optionId: string) => {
     if (!question || locked) return;
@@ -142,6 +153,7 @@ export default function Participate() {
             submitState={submitState}
             ackReason={ackReason}
             quizFeedback={quizFeedback}
+            submissionCount={submissionCount}
             onSubmitChoice={submitChoice}
             onSubmitText={submitText}
             onTextKeyDown={handleTextKeyDown}
@@ -176,17 +188,23 @@ function QuestionBody(props: {
   submitState: SubmitState;
   ackReason?: string;
   quizFeedback: { correct: boolean; correctOptionId: string } | null;
+  submissionCount: number;
   onSubmitChoice: (optionId: string) => void;
   onSubmitText: () => void;
   onTextKeyDown: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
 }) {
-  const { question, choice, text, setText, locked, submitState, ackReason, quizFeedback, onSubmitChoice, onSubmitText, onTextKeyDown } = props;
+  const { question, choice, text, setText, locked, submitState, ackReason, quizFeedback, submissionCount, onSubmitChoice, onSubmitText, onTextKeyDown } = props;
 
   return (
     <div className="flex flex-col gap-6">
       <div>
         <span className="font-mono text-xs uppercase tracking-wide text-stage-muted">{typeLabel(question.type)}</span>
         <h1 className="text-3xl font-extrabold leading-tight tracking-tight mt-2 text-balance">{question.prompt}</h1>
+        <p className="mt-2 text-xs text-stage-muted">
+          {question.submissionMode === 'single' && '한 번 제출할 수 있어요'}
+          {question.submissionMode === 'multiple' && `여러 번 제출 가능 · ${submissionCount} / ${question.maxSubmissions}회`}
+          {question.submissionMode === 'replace' && '다시 제출하면 이전 답이 바뀌어요'}
+        </p>
       </div>
 
       {(question.type === 'multiple_choice' || question.type === 'quiz') && (
@@ -243,7 +261,13 @@ function QuestionBody(props: {
 
       {submitState === 'done' && (
         <p className="text-center text-sm font-semibold text-stage-accent">
-          {quizFeedback ? (quizFeedback.correct ? '정답이에요! 🎉' : '아쉬워요, 오답이에요.') : '제출 완료!'}
+          {quizFeedback
+            ? (quizFeedback.correct ? '정답이에요! 🎉' : '아쉬워요, 오답이에요.')
+            : question.submissionMode === 'multiple'
+              ? `${submissionCount}회 제출했어요. 계속 응답할 수 있어요.`
+              : question.submissionMode === 'replace'
+                ? '제출했어요. 다시 제출하면 답이 바뀌어요.'
+                : '제출 완료!'}
         </p>
       )}
       {submitState === 'error' && <p className="text-center text-sm text-stage-muted">{reasonText(ackReason)}</p>}
