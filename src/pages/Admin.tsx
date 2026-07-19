@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { usePollSocket } from '../lib/usePollSocket';
+import { saveRecentPoll } from '../lib/recentPolls';
 import type {
+  AdminAccessRequest,
+  AdminAccessResponse,
   Aggregate,
   AdminQuestion,
   NewQuestionInput,
@@ -50,7 +53,7 @@ function formatElapsed(ms: number): string {
 export default function Admin() {
   const { pollId = '' } = useParams();
 
-  const [adminKey] = useState(() => {
+  const [adminKey, setAdminKey] = useState(() => {
     const fromQuery = new URLSearchParams(window.location.search).get('k');
     const fromFragment = new URLSearchParams(window.location.hash.slice(1)).get('k');
     const fromUrl = fromFragment ?? fromQuery;
@@ -75,6 +78,7 @@ export default function Admin() {
   const handleMessage = useCallback((msg: ServerMessage) => {
     if (msg.type === 'state' && msg.role === 'admin') {
       setView({ poll: msg.poll, questions: msg.questions, activeQuestionId: msg.activeQuestionId });
+      saveRecentPoll(msg.poll.id, msg.poll.title);
       return;
     }
     if (msg.type === 'presence') {
@@ -91,7 +95,7 @@ export default function Admin() {
     }
   }, []);
 
-  const { status, send } = usePollSocket(pollId, 'admin', { adminKey, onMessage: handleMessage });
+  const { status, send } = usePollSocket(pollId, 'admin', { adminKey, enabled: Boolean(adminKey), onMessage: handleMessage });
 
   // 실시간 경과 시간 표시용 1초 tick
   useEffect(() => {
@@ -170,16 +174,27 @@ export default function Admin() {
     }
   };
 
+  if (!adminKey) {
+    return <AdminAccess pollId={pollId} onAccess={(key) => setAdminKey(key)} />;
+  }
+
   if (status === 'rejected') {
     return (
       <div className="min-h-full flex items-center justify-center bg-bento-bg px-6">
         <div className="max-w-sm text-center">
           <p className="text-2xl mb-2">🔒</p>
           <h1 className="text-lg font-bold text-bento-ink mb-2">관리자 권한을 확인할 수 없어요</h1>
-          <p className="text-sm text-bento-muted">
-            링크에 <code className="font-mono">?k=</code> 관리자 키가 없거나 잘못됐어요. 설문을 만들 때 받은 링크를 다시
-            확인해주세요.
-          </p>
+          <p className="text-sm text-bento-muted">이 기기에 저장된 관리자 권한이 만료되었거나 올바르지 않아요.</p>
+          <button
+            type="button"
+            onClick={() => {
+              localStorage.removeItem(`pollplus:adminKey:${pollId}`);
+              setAdminKey('');
+            }}
+            className="mt-4 rounded-lg bg-bento-accent px-3 py-2 text-sm font-semibold text-white"
+          >
+            비밀번호로 다시 인증
+          </button>
         </div>
       </div>
     );
@@ -267,6 +282,67 @@ export default function Admin() {
           <LinksCard participantUrl={participantUrl} presentUrl={presentUrl} onCopy={copyLink} />
         </div>
       </main>
+    </div>
+  );
+}
+
+function AdminAccess(props: { pollId: string; onAccess: (adminKey: string) => void }) {
+  const { pollId, onAccess } = props;
+  const [password, setPassword] = useState('');
+  const [recoveryCode, setRecoveryCode] = useState('');
+  const [useRecoveryCode, setUseRecoveryCode] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const credential = useRecoveryCode ? recoveryCode.trim() : password;
+    if (!credential || submitting) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      const body: AdminAccessRequest = useRecoveryCode ? { recoveryCode: credential } : { password: credential };
+      const response = await fetch(`/api/polls/${pollId}/admin-access`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const result: AdminAccessResponse = await response.json();
+      if (!response.ok || !result.ok) {
+        if (!result.ok && result.reason === 'rate_limited') throw new Error('시도 횟수가 많아요. 10분 후에 다시 시도해주세요.');
+        if (!result.ok && result.reason === 'password_not_configured') throw new Error('이전 방식으로 만든 설문이라 비밀번호가 설정되지 않았어요. 기존 기기의 관리자 링크를 사용해주세요.');
+        throw new Error('비밀번호 또는 복구 코드가 올바르지 않아요.');
+      }
+      localStorage.setItem(`pollplus:adminKey:${pollId}`, result.adminKey);
+      onAccess(result.adminKey);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '관리자 권한을 확인하지 못했어요.');
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="min-h-full flex items-center justify-center bg-bento-bg px-6">
+      <form onSubmit={submit} className="w-full max-w-sm rounded-2xl border border-bento-border bg-bento-surface p-6">
+        <p className="text-xs font-semibold tracking-wide uppercase text-bento-muted">PollPlus · 관리자</p>
+        <h1 className="mt-1 text-xl font-bold text-bento-ink">설문 관리하기</h1>
+        <p className="mt-2 text-sm text-bento-muted">방 번호 <b className="font-mono text-bento-ink">{pollId}</b>의 관리자 비밀번호를 입력하세요.</p>
+        <input
+          type={useRecoveryCode ? 'text' : 'password'}
+          value={useRecoveryCode ? recoveryCode : password}
+          onChange={(event) => (useRecoveryCode ? setRecoveryCode(event.target.value) : setPassword(event.target.value))}
+          placeholder={useRecoveryCode ? '복구 코드' : '관리자 비밀번호'}
+          autoComplete={useRecoveryCode ? 'off' : 'current-password'}
+          className="mt-5 w-full rounded-xl border border-bento-border bg-bento-bg px-4 py-3 text-bento-ink placeholder:text-bento-muted focus:outline-none focus:ring-2 focus:ring-bento-accent"
+        />
+        <button type="submit" disabled={!((useRecoveryCode ? recoveryCode : password).trim()) || submitting} className="mt-3 w-full rounded-xl bg-bento-accent px-4 py-3 font-semibold text-white disabled:opacity-40">
+          {submitting ? '확인 중…' : '관리자 화면 열기'}
+        </button>
+        <button type="button" onClick={() => { setUseRecoveryCode((value) => !value); setError(null); }} className="mt-3 w-full text-xs font-semibold text-bento-accent">
+          {useRecoveryCode ? '비밀번호로 인증하기' : '비밀번호를 잊었어요 · 복구 코드 사용'}
+        </button>
+        {error && <p className="mt-3 text-sm text-bento-bad">{error}</p>}
+      </form>
     </div>
   );
 }

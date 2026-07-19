@@ -170,9 +170,21 @@ export type ServerMessage =
 
 export interface CreatePollRequest {
   title: string;
+  adminPassword: string;
 }
 
 export interface CreatePollResponse {
   pollId: string;
   adminKey: string;
+  /** 최초 생성 시 한 번만 보여 주는 관리자 복구 코드 */
+  recoveryCode: string;
 }
+
+export interface AdminAccessRequest {
+  password?: string;
+  recoveryCode?: string;
+}
+
+export type AdminAccessResponse =
+  | { ok: true; adminKey: string }
+  | { ok: false; reason: 'invalid' | 'rate_limited' | 'password_not_configured' };

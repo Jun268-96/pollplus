@@ -16,6 +16,7 @@ import type {
 } from '../shared/types';
 import { toPublicQuestion } from '../shared/types';
 import type { Env } from './env';
+import { verifyPassword } from './auth';
 
 // ---------------------------------------------------------------------------
 // DB row shapes (SqlStorage만 다루는 내부 타입 — SqlStorageValue엔 boolean이 없어
@@ -27,6 +28,8 @@ interface PollRow {
   id: string;
   title: string;
   admin_key: string;
+  admin_password_hash: string | null;
+  admin_password_salt: string | null;
   active_question_id: string | null;
   created_at: number;
 }
@@ -75,6 +78,13 @@ interface ColumnInfoRow {
   name: string;
 }
 
+interface AdminAccessAttemptRow {
+  [key: string]: SqlStorageValue;
+  failed_count: number;
+  window_started_at: number;
+  blocked_until: number;
+}
+
 /** WebSocket 연결(소켓)마다 serializeAttachment로 저장하는 메타데이터.
  *  참여자 쪽엔 아무것도 저장하지 않는 대신(계획서 "참여자 클라이언트 = 무캐싱 거울"),
  *  중복 제출 방지는 서버가 이 연결 자체에 붙여서 관리한다. */
@@ -95,6 +105,9 @@ const MAX_OPTIONS = 10;
 const MAX_RESPONSE_TEXT_LENGTH = 1_000;
 const MAX_MULTIPLE_SUBMISSIONS = 20;
 const MULTIPLE_SUBMISSION_COOLDOWN_MS = 1_200;
+const ADMIN_ACCESS_MAX_FAILURES = 5;
+const ADMIN_ACCESS_WINDOW_MS = 10 * 60_000;
+const ADMIN_ACCESS_BLOCK_MS = 10 * 60_000;
 
 function isSubmissionMode(value: unknown): value is SubmissionMode {
   return value === 'single' || value === 'multiple' || value === 'replace';
@@ -238,6 +251,8 @@ export class PollRoom extends DurableObject<Env> {
           id TEXT PRIMARY KEY,
           title TEXT NOT NULL,
           admin_key TEXT NOT NULL,
+          admin_password_hash TEXT,
+          admin_password_salt TEXT,
           active_question_id TEXT,
           created_at INTEGER NOT NULL
         )
@@ -266,6 +281,14 @@ export class PollRoom extends DurableObject<Env> {
           created_at INTEGER NOT NULL
         )
       `);
+      ctx.storage.sql.exec(`
+        CREATE TABLE IF NOT EXISTS admin_access_attempts (
+          client_fingerprint TEXT PRIMARY KEY,
+          failed_count INTEGER NOT NULL,
+          window_started_at INTEGER NOT NULL,
+          blocked_until INTEGER NOT NULL DEFAULT 0
+        )
+      `);
 
       // 이미 배포된 v1 설문의 SQLite 테이블도 안전하게 확장한다.
       const questionColumns = ctx.storage.sql.exec<ColumnInfoRow>('PRAGMA table_info(questions)').toArray();
@@ -276,6 +299,14 @@ export class PollRoom extends DurableObject<Env> {
       if (!columnNames.has('max_submissions')) {
         ctx.storage.sql.exec('ALTER TABLE questions ADD COLUMN max_submissions INTEGER NOT NULL DEFAULT 1');
       }
+      const pollColumns = ctx.storage.sql.exec<ColumnInfoRow>('PRAGMA table_info(poll)').toArray();
+      const pollColumnNames = new Set(pollColumns.map((column) => column.name));
+      if (!pollColumnNames.has('admin_password_hash')) {
+        ctx.storage.sql.exec('ALTER TABLE poll ADD COLUMN admin_password_hash TEXT');
+      }
+      if (!pollColumnNames.has('admin_password_salt')) {
+        ctx.storage.sql.exec('ALTER TABLE poll ADD COLUMN admin_password_salt TEXT');
+      }
     });
   }
 
@@ -283,16 +314,62 @@ export class PollRoom extends DurableObject<Env> {
   // RPC: Worker가 poll 생성 직후 1회 호출 (idempotent)
   // ---------------------------------------------------------------------
 
-  async initPoll(pollId: string, title: string, adminKey: string): Promise<void> {
+  async initPoll(pollId: string, title: string, adminKey: string, passwordHash: string, passwordSalt: string): Promise<void> {
     const existing = this.ctx.storage.sql.exec<IdRow>('SELECT id FROM poll LIMIT 1').toArray();
     if (existing.length > 0) return;
     this.ctx.storage.sql.exec(
-      'INSERT INTO poll (id, title, admin_key, active_question_id, created_at) VALUES (?, ?, ?, NULL, ?)',
+      'INSERT INTO poll (id, title, admin_key, admin_password_hash, admin_password_salt, active_question_id, created_at) VALUES (?, ?, ?, ?, ?, NULL, ?)',
       pollId,
       title,
       adminKey,
+      passwordHash,
+      passwordSalt,
       Date.now(),
     );
+  }
+
+  /** 비밀번호/복구 코드 검증 뒤에만 WebSocket 관리자 토큰을 반환한다. */
+  async verifyAdminAccess(
+    password: string | null,
+    recoveryCode: string | null,
+    clientFingerprint: string,
+  ): Promise<{ ok: true; adminKey: string } | { ok: false; reason: 'invalid' | 'rate_limited' | 'password_not_configured' }> {
+    const poll = this.getPoll();
+    if (!poll) return { ok: false, reason: 'invalid' };
+
+    const now = Date.now();
+    const attempts = this.ctx.storage.sql
+      .exec<AdminAccessAttemptRow>(
+        'SELECT failed_count, window_started_at, blocked_until FROM admin_access_attempts WHERE client_fingerprint = ?',
+        clientFingerprint,
+      )
+      .toArray()[0];
+    if (attempts && attempts.blocked_until > now) return { ok: false, reason: 'rate_limited' };
+
+    let accepted = recoveryCode === poll.admin_key;
+    if (!accepted && password) {
+      if (!poll.admin_password_hash || !poll.admin_password_salt) return { ok: false, reason: 'password_not_configured' };
+      accepted = await verifyPassword(password, poll.admin_password_salt, poll.admin_password_hash);
+    }
+
+    if (accepted) {
+      this.ctx.storage.sql.exec('DELETE FROM admin_access_attempts WHERE client_fingerprint = ?', clientFingerprint);
+      return { ok: true, adminKey: poll.admin_key };
+    }
+
+    const windowStartedAt = attempts && now - attempts.window_started_at < ADMIN_ACCESS_WINDOW_MS ? attempts.window_started_at : now;
+    const failedCount = attempts && now - attempts.window_started_at < ADMIN_ACCESS_WINDOW_MS ? attempts.failed_count + 1 : 1;
+    const blockedUntil = failedCount >= ADMIN_ACCESS_MAX_FAILURES ? now + ADMIN_ACCESS_BLOCK_MS : 0;
+    this.ctx.storage.sql.exec(
+      `INSERT INTO admin_access_attempts (client_fingerprint, failed_count, window_started_at, blocked_until)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(client_fingerprint) DO UPDATE SET failed_count = excluded.failed_count, window_started_at = excluded.window_started_at, blocked_until = excluded.blocked_until`,
+      clientFingerprint,
+      failedCount,
+      windowStartedAt,
+      blockedUntil,
+    );
+    return { ok: false, reason: blockedUntil > now ? 'rate_limited' : 'invalid' };
   }
 
   // ---------------------------------------------------------------------

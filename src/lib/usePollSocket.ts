@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ClientMessage, Role, ServerMessage } from '../../shared/types';
 
-export type ConnectionStatus = 'connecting' | 'open' | 'closed' | 'rejected';
+export type ConnectionStatus = 'idle' | 'connecting' | 'open' | 'closed' | 'rejected';
 
 interface UsePollSocketOptions {
   adminKey?: string;
+  enabled?: boolean;
   onMessage: (msg: ServerMessage) => void;
 }
 
@@ -23,8 +24,8 @@ const GIVE_UP_AFTER_ATTEMPTS = 4;
  * - 지수 백오프로 자동 재연결. 단 한 번도 연결 성공한 적 없이 계속 실패하면 'rejected'로 멈춘다.
  * - 알 수 없는 메시지는 무시(크래시 금지) — JSON.parse 실패 시에도 무시.
  */
-export function usePollSocket(pollId: string, role: Role, { adminKey, onMessage }: UsePollSocketOptions) {
-  const [status, setStatus] = useState<ConnectionStatus>('connecting');
+export function usePollSocket(pollId: string, role: Role, { adminKey, enabled = true, onMessage }: UsePollSocketOptions) {
+  const [status, setStatus] = useState<ConnectionStatus>(enabled ? 'connecting' : 'idle');
   const wsRef = useRef<WebSocket | null>(null);
   const onMessageRef = useRef(onMessage);
   onMessageRef.current = onMessage;
@@ -34,7 +35,7 @@ export function usePollSocket(pollId: string, role: Role, { adminKey, onMessage 
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const connect = useCallback(() => {
-    if (unmountedRef.current) return;
+    if (unmountedRef.current || !enabled) return;
     setStatus('connecting');
 
     const url = new URL(`/api/polls/${pollId}/ws`, window.location.href);
@@ -80,19 +81,25 @@ export function usePollSocket(pollId: string, role: Role, { adminKey, onMessage 
       ws.close();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pollId, role, adminKey]);
+  }, [pollId, role, adminKey, enabled]);
 
   useEffect(() => {
     unmountedRef.current = false;
     attemptRef.current = 0;
     everOpenedRef.current = false;
+    if (!enabled) {
+      setStatus('idle');
+      return () => {
+        unmountedRef.current = true;
+      };
+    }
     connect();
     return () => {
       unmountedRef.current = true;
       if (timerRef.current) clearTimeout(timerRef.current);
       wsRef.current?.close();
     };
-  }, [connect]);
+  }, [connect, enabled]);
 
   const send = useCallback((msg: ClientMessage) => {
     const ws = wsRef.current;
