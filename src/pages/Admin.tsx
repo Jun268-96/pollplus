@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { usePollSocket } from '../lib/usePollSocket';
 import { saveRecentPoll } from '../lib/recentPolls';
@@ -11,6 +11,8 @@ import type {
   QuestionOption,
   QuestionPatch,
   QuestionType,
+  PublicationMode,
+  ResponsePublicationState,
   ResponseItem,
   ServerMessage,
   SubmissionMode,
@@ -43,6 +45,12 @@ const SUBMISSION_LABEL: Record<SubmissionMode, string> = {
   replace: '답 변경',
 };
 
+type TvControllerAction = 'prev' | 'next' | 'stop' | 'toggle_results' | 'set_response_state';
+
+function isTvControllerAction(value: unknown): value is TvControllerAction {
+  return value === 'prev' || value === 'next' || value === 'stop' || value === 'toggle_results' || value === 'set_response_state';
+}
+
 function formatElapsed(ms: number): string {
   const totalSec = Math.max(0, Math.floor(ms / 1000));
   const m = Math.floor(totalSec / 60);
@@ -74,6 +82,8 @@ export default function Admin() {
   const [adding, setAdding] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const [copyNotice, setCopyNotice] = useState<string | null>(null);
+  const tvWindowRef = useRef<Window | null>(null);
+  const tvControllerIdRef = useRef<string | null>(null);
 
   const handleMessage = useCallback((msg: ServerMessage) => {
     if (msg.type === 'state' && msg.role === 'admin') {
@@ -180,6 +190,82 @@ export default function Admin() {
     }
   };
 
+  const openPresentation = () => {
+    const opened = window.open(presentUrl, `pollplus-tv-${pollId}`, 'popup=yes,width=1440,height=900');
+    if (!opened) {
+      setCopyNotice('새 창이 차단됐어요. TV 링크를 복사해 열어주세요.');
+      return;
+    }
+    tvWindowRef.current = opened;
+    tvControllerIdRef.current = null;
+    opened.focus();
+  };
+
+  const sendTvControllerState = (target: Window, controllerId: string) => {
+    const active = view.questions.find((question) => question.id === view.activeQuestionId) ?? null;
+    const aggregate = active ? results[active.id] : undefined;
+    const moderation =
+      active && (active.type === 'open_text' || active.type === 'word_cloud') && (aggregate?.type === 'open_text' || aggregate?.type === 'word_cloud')
+        ? aggregate.items
+            .filter((item) => item.publicationState === 'published')
+            .map((item) => ({ id: item.id, text: item.text }))
+        : [];
+    target.postMessage(
+      {
+        source: 'pollplus-admin',
+        type: 'controller_state',
+        controllerId,
+        activeQuestionId: active?.id ?? null,
+        hasPrev: activeIndex > 0,
+        hasNext: activeIndex >= 0 && activeIndex < orderedIds.length - 1,
+        accepting: active?.accepting ?? false,
+        resultsVisible: active?.resultsVisible ?? false,
+        moderation,
+      },
+      window.location.origin,
+    );
+  };
+
+  useEffect(() => {
+    const handleTvMessage = (event: MessageEvent<unknown>) => {
+      if (event.origin !== window.location.origin || event.source !== tvWindowRef.current || !event.data || typeof event.data !== 'object') return;
+      const data = event.data as Record<string, unknown>;
+      if (data.source !== 'pollplus-tv' || typeof data.type !== 'string') return;
+
+      if (data.type === 'controller_ready') {
+        const target = tvWindowRef.current;
+        if (!target) return;
+        const controllerId = crypto.randomUUID();
+        tvControllerIdRef.current = controllerId;
+        sendTvControllerState(target, controllerId);
+        return;
+      }
+
+      if (data.type !== 'controller_command' || data.controllerId !== tvControllerIdRef.current || !isTvControllerAction(data.action)) return;
+      if (data.action === 'prev') goPrev();
+      if (data.action === 'next') goNext();
+      if (data.action === 'stop' && view.activeQuestionId) stopQuestion(view.activeQuestionId);
+      if (data.action === 'toggle_results' && activeQuestion) {
+        send({ type: 'set_results_visible', questionId: activeQuestion.id, visible: !activeQuestion.resultsVisible });
+      }
+      if (
+        data.action === 'set_response_state' &&
+        typeof data.responseId === 'string' &&
+        (data.state === 'pending' || data.state === 'published' || data.state === 'hidden')
+      ) {
+        send({ type: 'set_response_state', responseId: data.responseId, state: data.state });
+      }
+    };
+    window.addEventListener('message', handleTvMessage);
+    return () => window.removeEventListener('message', handleTvMessage);
+  });
+
+  useEffect(() => {
+    if (tvWindowRef.current && tvControllerIdRef.current && !tvWindowRef.current.closed) {
+      sendTvControllerState(tvWindowRef.current, tvControllerIdRef.current);
+    }
+  });
+
   if (!adminKey) {
     return <AdminAccess pollId={pollId} onAccess={(key) => setAdminKey(key)} />;
   }
@@ -282,11 +368,11 @@ export default function Admin() {
             <ResultsPanel
               question={activeQuestion}
               aggregate={activeAggregate}
-              onHideResponse={(responseId) => send({ type: 'hide_response', responseId })}
+              onSetResponseState={(responseId, state) => send({ type: 'set_response_state', responseId, state })}
             />
           </div>
 
-          <LinksCard participantUrl={participantUrl} presentUrl={presentUrl} onCopy={copyLink} />
+          <LinksCard participantUrl={participantUrl} presentUrl={presentUrl} onCopy={copyLink} onOpenPresentation={openPresentation} />
         </div>
       </main>
     </div>
@@ -626,6 +712,7 @@ function AddQuestionForm(props: { onCancel: () => void; onSubmit: (input: NewQue
   const [correctOptionId, setCorrectOptionId] = useState<string>('');
   const [submissionMode, setSubmissionMode] = useState<SubmissionMode>('single');
   const [maxSubmissions, setMaxSubmissions] = useState(3);
+  const [publicationMode, setPublicationMode] = useState<PublicationMode>('auto');
 
   const choiceType = isChoiceType(type);
 
@@ -636,6 +723,7 @@ function AddQuestionForm(props: { onCancel: () => void; onSubmit: (input: NewQue
       prompt: prompt.trim(),
       submissionMode,
       maxSubmissions: submissionMode === 'multiple' ? maxSubmissions : 1,
+      publicationMode: choiceType ? 'auto' : publicationMode,
     };
     if (choiceType) {
       const cleaned = options.filter((o) => o.text.trim().length > 0);
@@ -656,7 +744,10 @@ function AddQuestionForm(props: { onCancel: () => void; onSubmit: (input: NewQue
           <button
             key={t}
             type="button"
-            onClick={() => setType(t)}
+            onClick={() => {
+              setType(t);
+              setPublicationMode(t === 'open_text' ? 'approval' : 'auto');
+            }}
             className={
               'rounded-lg border px-2 py-2 text-xs font-semibold ' +
               (type === t ? 'border-bento-accent bg-bento-accent-soft text-bento-accent' : 'border-bento-border text-bento-muted')
@@ -681,6 +772,10 @@ function AddQuestionForm(props: { onCancel: () => void; onSubmit: (input: NewQue
         onModeChange={setSubmissionMode}
         onMaxChange={setMaxSubmissions}
       />
+
+      {!choiceType && (
+        <PublicationPolicyFields mode={publicationMode} onModeChange={setPublicationMode} />
+      )}
 
       {choiceType && (
         <OptionsEditor
@@ -803,6 +898,28 @@ function SubmissionPolicyFields(props: {
   );
 }
 
+function PublicationPolicyFields(props: { mode: PublicationMode; onModeChange: (mode: PublicationMode) => void }) {
+  const { mode, onModeChange } = props;
+  return (
+    <div className="rounded-lg border border-bento-border bg-bento-bg p-3 flex flex-col gap-2">
+      <div className="flex items-center justify-between gap-3">
+        <label className="text-xs font-semibold text-bento-muted">TV 송출 방식</label>
+        <select
+          value={mode}
+          onChange={(e) => onModeChange(e.target.value as PublicationMode)}
+          className="rounded-md border border-bento-border bg-bento-surface px-2 py-1.5 text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-bento-accent"
+        >
+          <option value="auto">자동 송출</option>
+          <option value="approval">교사 승인</option>
+        </select>
+      </div>
+      <p className="text-[11px] leading-relaxed text-bento-muted">
+        {mode === 'approval' ? '새 응답은 대기 목록에 쌓이고, 송출을 눌러야 TV에 보여요.' : '새 응답이 즉시 TV에 반영되며, 필요하면 송출에서 내릴 수 있어요.'}
+      </p>
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // 문항 편집 (선택된 문항 — 활성 문항이면 구조 편집 잠금)
 // ---------------------------------------------------------------------------
@@ -820,6 +937,7 @@ function QuestionEditor(props: {
   );
   const [submissionMode, setSubmissionMode] = useState<SubmissionMode>(question?.submissionMode ?? 'single');
   const [maxSubmissions, setMaxSubmissions] = useState(question?.maxSubmissions ?? 1);
+  const [publicationMode, setPublicationMode] = useState<PublicationMode>(question?.publicationMode ?? 'auto');
 
   if (!question) {
     return (
@@ -844,6 +962,9 @@ function QuestionEditor(props: {
     if (submissionMode !== question.submissionMode || nextMax !== question.maxSubmissions) {
       onSave({ submissionMode, maxSubmissions: nextMax });
     }
+  };
+  const savePublicationPolicy = () => {
+    if (publicationMode !== question.publicationMode) onSave({ publicationMode });
   };
 
   return (
@@ -882,6 +1003,20 @@ function QuestionEditor(props: {
         </button>
       </fieldset>
 
+      {!choiceType && (
+        <div>
+          <PublicationPolicyFields mode={publicationMode} onModeChange={setPublicationMode} />
+          <button
+            type="button"
+            onClick={savePublicationPolicy}
+            className="mt-2 text-xs font-semibold px-3 py-1.5 rounded-lg bg-bento-accent text-white"
+          >
+            송출 방식 저장
+          </button>
+          <p className="mt-1 text-[10px] text-bento-muted">변경 내용은 이후 새 응답부터 적용돼요.</p>
+        </div>
+      )}
+
       {choiceType && (
         <fieldset disabled={structureLocked} className="disabled:opacity-50">
           <OptionsEditor
@@ -912,9 +1047,9 @@ function QuestionEditor(props: {
 function ResultsPanel(props: {
   question: AdminQuestion | null;
   aggregate?: Aggregate;
-  onHideResponse: (responseId: string) => void;
+  onSetResponseState: (responseId: string, state: ResponsePublicationState) => void;
 }) {
-  const { question, aggregate, onHideResponse } = props;
+  const { question, aggregate, onSetResponseState } = props;
 
   if (!question) {
     return (
@@ -941,11 +1076,11 @@ function ResultsPanel(props: {
           correctOptionId={aggregate.correctOptionId}
         />
       )}
-      {aggregate?.type === 'open_text' && <ModerationList items={aggregate.items} onHide={onHideResponse} />}
+      {aggregate?.type === 'open_text' && <ModerationInbox items={aggregate.items} onSetState={onSetResponseState} />}
       {aggregate?.type === 'word_cloud' && (
         <div className="flex flex-col gap-3">
           <WordCloudView words={aggregate.words} />
-          <ModerationList items={aggregate.items} onHide={onHideResponse} compact />
+          <ModerationInbox items={aggregate.items} onSetState={onSetResponseState} compact />
         </div>
       )}
       {aggregate?.type === 'hidden' && <p className="text-sm text-bento-muted">{aggregate.total}명 응답함</p>}
@@ -1013,29 +1148,72 @@ function WordCloudView(props: { words: { text: string; count: number }[] }) {
   );
 }
 
-function ModerationList(props: { items: ResponseItem[]; onHide: (id: string) => void; compact?: boolean }) {
-  const { items, onHide, compact } = props;
-  if (items.length === 0) return <p className="text-sm text-bento-muted">아직 응답이 없어요</p>;
+function ModerationInbox(props: {
+  items: ResponseItem[];
+  onSetState: (id: string, state: ResponsePublicationState) => void;
+  compact?: boolean;
+}) {
+  const { items, onSetState, compact } = props;
+  const [tab, setTab] = useState<ResponsePublicationState>('pending');
+  const counts = {
+    pending: items.filter((item) => item.publicationState === 'pending').length,
+    published: items.filter((item) => item.publicationState === 'published').length,
+    hidden: items.filter((item) => item.publicationState === 'hidden').length,
+  };
+  const visibleItems = items.filter((item) => item.publicationState === tab);
+  const labels: Record<ResponsePublicationState, string> = {
+    pending: '대기',
+    published: '송출 중',
+    hidden: '숨김',
+  };
+
   return (
-    <div className={compact ? 'flex flex-col gap-1 max-h-40 overflow-y-auto' : 'flex flex-col gap-1'}>
-      {[...items]
+    <div className="flex flex-col gap-2">
+      <div className="flex gap-1" role="tablist" aria-label="응답 송출 상태">
+        {(Object.keys(labels) as ResponsePublicationState[]).map((state) => (
+          <button
+            key={state}
+            type="button"
+            role="tab"
+            aria-selected={tab === state}
+            onClick={() => setTab(state)}
+            className={
+              'rounded-md px-2 py-1 text-[11px] font-semibold ' +
+              (tab === state ? 'bg-bento-accent text-white' : 'bg-bento-bg text-bento-muted hover:text-bento-ink')
+            }
+          >
+            {labels[state]} {counts[state]}
+          </button>
+        ))}
+      </div>
+      {visibleItems.length === 0 && <p className="py-2 text-center text-xs text-bento-muted">{labels[tab]} 응답이 없어요</p>}
+      <div className={compact ? 'flex max-h-40 flex-col gap-1 overflow-y-auto' : 'flex flex-col gap-1'}>
+        {[...visibleItems]
         .reverse()
         .map((item) => (
           <div
             key={item.id}
             className="flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm border-b border-bento-border last:border-none"
-          >
-            <span className="flex-1 truncate">{item.text}</span>
-            <button
-              type="button"
-              onClick={() => onHide(item.id)}
-              className="w-5 h-5 shrink-0 rounded border border-bento-border text-bento-muted hover:border-bento-bad hover:text-bento-bad text-xs"
-              aria-label="삭제"
             >
-              ×
-            </button>
+            <span className="flex-1 truncate">{item.text}</span>
+            {item.publicationState === 'pending' && (
+              <>
+                <button type="button" onClick={() => onSetState(item.id, 'published')} className="shrink-0 rounded border border-bento-accent px-1.5 py-0.5 text-[10px] font-semibold text-bento-accent hover:bg-bento-accent-soft">송출</button>
+                <button type="button" onClick={() => onSetState(item.id, 'hidden')} className="shrink-0 rounded border border-bento-border px-1.5 py-0.5 text-[10px] text-bento-muted hover:border-bento-bad hover:text-bento-bad">숨김</button>
+              </>
+            )}
+            {item.publicationState === 'published' && (
+              <>
+                <button type="button" onClick={() => onSetState(item.id, 'pending')} className="shrink-0 rounded border border-bento-border px-1.5 py-0.5 text-[10px] text-bento-muted hover:text-bento-ink">내리기</button>
+                <button type="button" onClick={() => onSetState(item.id, 'hidden')} className="shrink-0 rounded border border-bento-border px-1.5 py-0.5 text-[10px] text-bento-muted hover:border-bento-bad hover:text-bento-bad">숨김</button>
+              </>
+            )}
+            {item.publicationState === 'hidden' && (
+              <button type="button" onClick={() => onSetState(item.id, 'pending')} className="shrink-0 rounded border border-bento-border px-1.5 py-0.5 text-[10px] text-bento-muted hover:text-bento-ink">대기로 복원</button>
+            )}
           </div>
         ))}
+      </div>
     </div>
   );
 }
@@ -1044,8 +1222,13 @@ function ModerationList(props: { items: ResponseItem[]; onHide: (id: string) => 
 // 링크 카드
 // ---------------------------------------------------------------------------
 
-function LinksCard(props: { participantUrl: string; presentUrl: string; onCopy: (url: string, label: string) => void }) {
-  const { participantUrl, presentUrl, onCopy } = props;
+function LinksCard(props: {
+  participantUrl: string;
+  presentUrl: string;
+  onCopy: (url: string, label: string) => void;
+  onOpenPresentation: () => void;
+}) {
+  const { participantUrl, presentUrl, onCopy, onOpenPresentation } = props;
   return (
     <div className="rounded-2xl border border-bento-border bg-bento-surface p-4 flex flex-col gap-4">
       <h3 className="text-xs font-bold uppercase tracking-wide text-bento-muted">공유 링크</h3>
@@ -1069,13 +1252,14 @@ function LinksCard(props: { participantUrl: string; presentUrl: string; onCopy: 
         <div className="rounded-lg border border-bento-border bg-bento-bg px-2.5 py-1.5 text-xs truncate mb-1.5 font-mono">
           {presentUrl}
         </div>
-        <button
-          type="button"
-          onClick={() => onCopy(presentUrl, 'TV 링크')}
-          className="w-full text-xs font-semibold rounded-lg border border-bento-accent text-bento-accent py-2"
-        >
-          TV 링크 복사
-        </button>
+        <div className="grid grid-cols-2 gap-2">
+          <button type="button" onClick={onOpenPresentation} className="text-xs font-semibold rounded-lg bg-bento-accent text-white py-2">
+            ↗ TV 화면 열기
+          </button>
+          <button type="button" onClick={() => onCopy(presentUrl, 'TV 링크')} className="text-xs font-semibold rounded-lg border border-bento-accent text-bento-accent py-2">
+            링크 복사
+          </button>
+        </div>
       </div>
     </div>
   );

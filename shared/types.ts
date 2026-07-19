@@ -3,6 +3,10 @@
 
 export type QuestionType = 'multiple_choice' | 'open_text' | 'word_cloud' | 'quiz';
 export type SubmissionMode = 'single' | 'multiple' | 'replace';
+/** 텍스트 응답을 TV에 반영하는 시점. 객관식·퀴즈는 항상 auto로 취급한다. */
+export type PublicationMode = 'auto' | 'approval';
+/** 관리자가 보는 원문 응답의 송출 상태. */
+export type ResponsePublicationState = 'pending' | 'published' | 'hidden';
 
 export interface QuestionOption {
   id: string;
@@ -21,6 +25,8 @@ interface QuestionCommon {
   submissionMode: SubmissionMode;
   /** multiple 모드에서 한 연결이 낼 수 있는 최대 응답 수 */
   maxSubmissions: number;
+  /** 텍스트형 문항의 TV 송출 정책 */
+  publicationMode: PublicationMode;
 }
 
 /** 관리자(admin)만 보는 전체 문항 — 퀴즈 정답 포함 */
@@ -61,6 +67,7 @@ export interface ResponseItem {
   id: string;
   text: string;
   createdAt: number;
+  publicationState: ResponsePublicationState;
 }
 
 // ---------------------------------------------------------------------------
@@ -74,11 +81,11 @@ export type Aggregate =
   | { type: 'word_cloud'; words: { text: string; count: number }[]; items: ResponseItem[] }
   | { type: 'hidden'; total: number };
 
-/** 공개 TV(viewer) 전용 집계. 자유서술 원문·응답 ID·시각은 관리자에게만 전달한다. */
+/** 공개 TV(viewer) 전용 집계. 승인된 자유서술 원문만 보내며, 응답 ID·시각은 관리자에게만 전달한다. */
 export type ViewerAggregate =
   | { type: 'multiple_choice'; total: number; counts: Record<string, number> }
   | { type: 'quiz'; total: number; counts: Record<string, number>; correctOptionId: string }
-  | { type: 'open_text'; total: number }
+  | { type: 'open_text'; total: number; items: { text: string }[] }
   | { type: 'word_cloud'; total: number; words: { text: string; count: number }[] }
   | { type: 'hidden' };
 
@@ -93,6 +100,7 @@ export interface NewQuestionInput {
   correctOptionId?: string; // quiz
   submissionMode?: SubmissionMode;
   maxSubmissions?: number;
+  publicationMode?: PublicationMode;
 }
 
 export type QuestionPatch = Partial<{
@@ -101,6 +109,7 @@ export type QuestionPatch = Partial<{
   correctOptionId: string;
   submissionMode: SubmissionMode;
   maxSubmissions: number;
+  publicationMode: PublicationMode;
 }>;
 
 // ---------------------------------------------------------------------------
@@ -121,6 +130,8 @@ export type ClientMessage =
   | { type: 'set_active'; questionId: string | null }
   | { type: 'set_accepting'; questionId: string; accepting: boolean }
   | { type: 'set_results_visible'; questionId: string; visible: boolean }
+  | { type: 'set_response_state'; responseId: string; state: ResponsePublicationState }
+  /** 이전 배포 클라이언트 호환용. 서버에서는 hidden 상태 변경으로 처리한다. */
   | { type: 'hide_response'; responseId: string }
   | { type: 'submit'; questionId: string; payload: ResponsePayload };
 

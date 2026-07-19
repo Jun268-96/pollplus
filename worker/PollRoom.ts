@@ -5,12 +5,15 @@ import type {
   NewQuestionInput,
   QuestionOption,
   QuestionPatch,
+  QuestionType,
   Aggregate,
   ResponseItem,
   ResponsePayload,
   Role,
   ServerMessage,
   PublicStateMessage,
+  PublicationMode,
+  ResponsePublicationState,
   SubmissionMode,
   ViewerAggregate,
 } from '../shared/types';
@@ -46,6 +49,7 @@ interface QuestionRow {
   results_visible: number;
   submission_mode: string;
   max_submissions: number;
+  publication_mode: string;
 }
 
 interface ResponseRow {
@@ -55,6 +59,7 @@ interface ResponseRow {
   socket_tag: string;
   payload: string;
   hidden: number;
+  publication_state: string;
   created_at: number;
 }
 
@@ -111,6 +116,24 @@ const ADMIN_ACCESS_BLOCK_MS = 10 * 60_000;
 
 function isSubmissionMode(value: unknown): value is SubmissionMode {
   return value === 'single' || value === 'multiple' || value === 'replace';
+}
+
+function isPublicationMode(value: unknown): value is PublicationMode {
+  return value === 'auto' || value === 'approval';
+}
+
+function isResponsePublicationState(value: unknown): value is ResponsePublicationState {
+  return value === 'pending' || value === 'published' || value === 'hidden';
+}
+
+function defaultPublicationMode(type: QuestionType): PublicationMode {
+  return type === 'open_text' ? 'approval' : 'auto';
+}
+
+function resolvePublicationMode(type: QuestionType, value: unknown): PublicationMode | null {
+  if (type !== 'open_text' && type !== 'word_cloud') return 'auto';
+  if (value === undefined) return defaultPublicationMode(type);
+  return isPublicationMode(value) ? value : null;
 }
 
 function isSubmissionLimit(value: unknown): value is number {
@@ -171,9 +194,10 @@ function parseClientMessage(value: unknown): ClientMessage | null {
       if (!isText(input.prompt, MAX_PROMPT_LENGTH)) return null;
       const { type, prompt } = input;
       const submission = resolveSubmissionSettings(input.submissionMode, input.maxSubmissions);
-      if (!submission) return null;
+      const publicationMode = resolvePublicationMode(type as QuestionType, input.publicationMode);
+      if (!submission || !publicationMode) return null;
       if (type === 'open_text' || type === 'word_cloud') {
-        return { type: 'add_question', input: { type, prompt: prompt.trim(), ...submission } };
+        return { type: 'add_question', input: { type, prompt: prompt.trim(), ...submission, publicationMode } };
       }
       if ((type === 'multiple_choice' || type === 'quiz') && isOptions(input.options)) {
         if (type === 'quiz' && (!isId(input.correctOptionId) || !input.options.some((o) => o.id === input.correctOptionId))) return null;
@@ -184,6 +208,7 @@ function parseClientMessage(value: unknown): ClientMessage | null {
             prompt: prompt.trim(),
             options: input.options,
             ...submission,
+            publicationMode,
             ...(type === 'quiz' ? { correctOptionId: input.correctOptionId as string } : {}),
           },
         };
@@ -213,15 +238,20 @@ function parseClientMessage(value: unknown): ClientMessage | null {
         if (!isSubmissionLimit(value.patch.maxSubmissions)) return null;
         patch.maxSubmissions = value.patch.maxSubmissions;
       }
+      if ('publicationMode' in value.patch) {
+        if (!isPublicationMode(value.patch.publicationMode)) return null;
+        patch.publicationMode = value.patch.publicationMode;
+      }
       if (Object.keys(patch).length === 0) return null;
       return { type: 'update_question', questionId: value.questionId, patch };
     }
     case 'delete_question':
+      return isId(value.questionId) ? { type: 'delete_question', questionId: value.questionId } : null;
     case 'hide_response':
-      return isId(value[value.type === 'delete_question' ? 'questionId' : 'responseId'])
-        ? (value.type === 'delete_question'
-          ? { type: 'delete_question', questionId: value.questionId as string }
-          : { type: 'hide_response', responseId: value.responseId as string })
+      return isId(value.responseId) ? { type: 'hide_response', responseId: value.responseId } : null;
+    case 'set_response_state':
+      return isId(value.responseId) && isResponsePublicationState(value.state)
+        ? { type: 'set_response_state', responseId: value.responseId, state: value.state }
         : null;
     case 'reorder_questions':
       return Array.isArray(value.questionIds) && value.questionIds.length <= MAX_QUESTIONS && value.questionIds.every(isId)
@@ -268,7 +298,8 @@ export class PollRoom extends DurableObject<Env> {
           accepting INTEGER NOT NULL DEFAULT 0,
           results_visible INTEGER NOT NULL DEFAULT 1,
           submission_mode TEXT NOT NULL DEFAULT 'single',
-          max_submissions INTEGER NOT NULL DEFAULT 1
+          max_submissions INTEGER NOT NULL DEFAULT 1,
+          publication_mode TEXT NOT NULL DEFAULT 'auto'
         )
       `);
       ctx.storage.sql.exec(`
@@ -278,6 +309,7 @@ export class PollRoom extends DurableObject<Env> {
           socket_tag TEXT NOT NULL,
           payload TEXT NOT NULL,
           hidden INTEGER NOT NULL DEFAULT 0,
+          publication_state TEXT NOT NULL DEFAULT 'published',
           created_at INTEGER NOT NULL
         )
       `);
@@ -298,6 +330,16 @@ export class PollRoom extends DurableObject<Env> {
       }
       if (!columnNames.has('max_submissions')) {
         ctx.storage.sql.exec('ALTER TABLE questions ADD COLUMN max_submissions INTEGER NOT NULL DEFAULT 1');
+      }
+      if (!columnNames.has('publication_mode')) {
+        // 기존 설문은 현재처럼 즉시 송출해 동작 변화를 만들지 않는다.
+        ctx.storage.sql.exec("ALTER TABLE questions ADD COLUMN publication_mode TEXT NOT NULL DEFAULT 'auto'");
+      }
+      const responseColumns = ctx.storage.sql.exec<ColumnInfoRow>('PRAGMA table_info(responses)').toArray();
+      const responseColumnNames = new Set(responseColumns.map((column) => column.name));
+      if (!responseColumnNames.has('publication_state')) {
+        ctx.storage.sql.exec("ALTER TABLE responses ADD COLUMN publication_state TEXT NOT NULL DEFAULT 'published'");
+        ctx.storage.sql.exec("UPDATE responses SET publication_state = 'hidden' WHERE hidden = 1");
       }
       const pollColumns = ctx.storage.sql.exec<ColumnInfoRow>('PRAGMA table_info(poll)').toArray();
       const pollColumnNames = new Set(pollColumns.map((column) => column.name));
@@ -477,7 +519,10 @@ export class PollRoom extends DurableObject<Env> {
         this.handleSetResultsVisible(parsed.questionId, parsed.visible);
         break;
       case 'hide_response':
-        this.handleHideResponse(parsed.responseId);
+        this.handleSetResponseState(parsed.responseId, 'hidden');
+        break;
+      case 'set_response_state':
+        this.handleSetResponseState(parsed.responseId, parsed.state);
         break;
     }
   }
@@ -505,7 +550,7 @@ export class PollRoom extends DurableObject<Env> {
     const id = crypto.randomUUID();
 
     this.ctx.storage.sql.exec(
-      'INSERT INTO questions (id, type, prompt, options, correct_option_id, position, accepting, results_visible, submission_mode, max_submissions) VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?)',
+      'INSERT INTO questions (id, type, prompt, options, correct_option_id, position, accepting, results_visible, submission_mode, max_submissions, publication_mode) VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?, ?)',
       id,
       input.type,
       input.prompt,
@@ -514,6 +559,7 @@ export class PollRoom extends DurableObject<Env> {
       position,
       input.submissionMode ?? 'single',
       input.submissionMode === 'multiple' ? input.maxSubmissions ?? 3 : 1,
+      input.publicationMode ?? defaultPublicationMode(input.type),
     );
 
     this.broadcastAdminState();
@@ -547,14 +593,19 @@ export class PollRoom extends DurableObject<Env> {
       nextSubmissionMode === 'multiple'
         ? patch.maxSubmissions ?? (question.submissionMode === 'multiple' ? question.maxSubmissions : 3)
         : 1;
+    const nextPublicationMode =
+      question.type === 'open_text' || question.type === 'word_cloud'
+        ? patch.publicationMode ?? question.publicationMode
+        : 'auto';
 
     this.ctx.storage.sql.exec(
-      'UPDATE questions SET prompt = ?, options = ?, correct_option_id = ?, submission_mode = ?, max_submissions = ? WHERE id = ?',
+      'UPDATE questions SET prompt = ?, options = ?, correct_option_id = ?, submission_mode = ?, max_submissions = ?, publication_mode = ? WHERE id = ?',
       nextPrompt,
       nextOptions ? JSON.stringify(nextOptions) : null,
       nextCorrect ?? null,
       nextSubmissionMode,
       nextMaxSubmissions,
+      nextPublicationMode,
       questionId,
     );
 
@@ -618,13 +669,20 @@ export class PollRoom extends DurableObject<Env> {
     this.broadcastResults(questionId);
   }
 
-  private handleHideResponse(responseId: string) {
+  private handleSetResponseState(responseId: string, state: ResponsePublicationState) {
     const rows = this.ctx.storage.sql
       .exec<QuestionIdRow>('SELECT question_id FROM responses WHERE id = ?', responseId)
       .toArray();
     const questionId = rows[0]?.question_id;
     if (!questionId) return;
-    this.ctx.storage.sql.exec('UPDATE responses SET hidden = 1 WHERE id = ?', responseId);
+    const question = this.getQuestion(questionId);
+    if (!question || (question.type !== 'open_text' && question.type !== 'word_cloud')) return;
+    this.ctx.storage.sql.exec(
+      'UPDATE responses SET publication_state = ?, hidden = ? WHERE id = ?',
+      state,
+      state === 'hidden' ? 1 : 0,
+      responseId,
+    );
     this.broadcastResults(questionId);
   }
 
@@ -693,12 +751,15 @@ export class PollRoom extends DurableObject<Env> {
     }
 
     const id = crypto.randomUUID();
+    const publicationState: ResponsePublicationState =
+      payload.kind === 'text' && question.publicationMode === 'approval' ? 'pending' : 'published';
     this.ctx.storage.sql.exec(
-      'INSERT INTO responses (id, question_id, socket_tag, payload, hidden, created_at) VALUES (?, ?, ?, ?, 0, ?)',
+      'INSERT INTO responses (id, question_id, socket_tag, payload, hidden, publication_state, created_at) VALUES (?, ?, ?, ?, 0, ?, ?)',
       id,
       questionId,
       attachment.socketTag,
       JSON.stringify(payload),
+      publicationState,
       now,
     );
 
@@ -745,6 +806,7 @@ export class PollRoom extends DurableObject<Env> {
       resultsVisible: row.results_visible === 1,
       submissionMode,
       maxSubmissions: submissionMode === 'multiple' ? Math.max(2, Math.min(MAX_MULTIPLE_SUBMISSIONS, row.max_submissions)) : 1,
+      publicationMode: isPublicationMode(row.publication_mode) ? row.publication_mode : 'auto',
     };
     switch (row.type) {
       case 'multiple_choice':
@@ -786,7 +848,7 @@ export class PollRoom extends DurableObject<Env> {
   private computeAggregate(question: AdminQuestion): Aggregate {
     const rows = this.ctx.storage.sql
       .exec<ResponseRow>(
-        'SELECT * FROM responses WHERE question_id = ? AND hidden = 0 ORDER BY created_at ASC',
+        'SELECT * FROM responses WHERE question_id = ? ORDER BY created_at ASC',
         question.id,
       )
       .toArray();
@@ -795,20 +857,26 @@ export class PollRoom extends DurableObject<Env> {
       const counts: Record<string, number> = {};
       for (const opt of question.options) counts[opt.id] = 0;
       for (const row of rows) {
+        if (row.publication_state === 'hidden') continue;
         const payload = JSON.parse(row.payload) as ResponsePayload;
         if (payload.kind === 'choice' && payload.optionId in counts) {
           counts[payload.optionId]++;
         }
       }
       if (question.type === 'quiz') {
-        return { type: 'quiz', total: rows.length, counts, correctOptionId: question.correctOptionId };
+        return { type: 'quiz', total: Object.values(counts).reduce((sum, count) => sum + count, 0), counts, correctOptionId: question.correctOptionId };
       }
-      return { type: 'multiple_choice', total: rows.length, counts };
+      return { type: 'multiple_choice', total: Object.values(counts).reduce((sum, count) => sum + count, 0), counts };
     }
 
     const items: ResponseItem[] = rows.map((row) => {
       const payload = JSON.parse(row.payload) as ResponsePayload;
-      return { id: row.id, text: payload.kind === 'text' ? payload.text : '', createdAt: row.created_at };
+      const publicationState: ResponsePublicationState = isResponsePublicationState(row.publication_state)
+        ? row.publication_state
+        : row.hidden === 1
+          ? 'hidden'
+          : 'published';
+      return { id: row.id, text: payload.kind === 'text' ? payload.text : '', createdAt: row.created_at, publicationState };
     });
 
     if (question.type === 'open_text') {
@@ -817,6 +885,7 @@ export class PollRoom extends DurableObject<Env> {
 
     const wordCounts = new Map<string, number>();
     for (const item of items) {
+      if (item.publicationState !== 'published') continue;
       const key = item.text.trim();
       if (!key) continue;
       wordCounts.set(key, (wordCounts.get(key) ?? 0) + 1);
@@ -909,9 +978,19 @@ export class PollRoom extends DurableObject<Env> {
       case 'quiz':
         return aggregate;
       case 'open_text':
-        return { type: 'open_text', total: aggregate.items.length };
+        return {
+          type: 'open_text',
+          total: aggregate.items.filter((item) => item.publicationState !== 'hidden').length,
+          items: aggregate.items
+            .filter((item) => item.publicationState === 'published')
+            .map((item) => ({ text: item.text })),
+        };
       case 'word_cloud':
-        return { type: 'word_cloud', total: aggregate.items.length, words: aggregate.words };
+        return {
+          type: 'word_cloud',
+          total: aggregate.items.filter((item) => item.publicationState !== 'hidden').length,
+          words: aggregate.words,
+        };
       case 'hidden':
         return { type: 'hidden' };
     }
