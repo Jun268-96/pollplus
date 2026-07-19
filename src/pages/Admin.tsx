@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
-import { Clock3, ListChecks, MessageCircleMore, UsersRound } from 'lucide-react';
+import { ListChecks, MessageCircleMore, UsersRound } from 'lucide-react';
 import { usePollSocket } from '../lib/usePollSocket';
 import { saveRecentPoll } from '../lib/recentPolls';
 import type {
@@ -52,13 +52,6 @@ function isTvControllerAction(value: unknown): value is TvControllerAction {
   return value === 'prev' || value === 'next' || value === 'stop' || value === 'toggle_results' || value === 'set_response_state';
 }
 
-function formatElapsed(ms: number): string {
-  const totalSec = Math.max(0, Math.floor(ms / 1000));
-  const m = Math.floor(totalSec / 60);
-  const s = totalSec % 60;
-  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-}
-
 export default function Admin() {
   const { pollId = '' } = useParams();
 
@@ -81,7 +74,6 @@ export default function Admin() {
   const [serverError, setServerError] = useState<string | null>(null);
   const [selectedQuestionId, setSelectedQuestionId] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
-  const [now, setNow] = useState(() => Date.now());
   const [copyNotice, setCopyNotice] = useState<string | null>(null);
   const tvWindowRef = useRef<Window | null>(null);
   const tvControllerIdRef = useRef<string | null>(null);
@@ -107,12 +99,6 @@ export default function Admin() {
   }, []);
 
   const { status, send } = usePollSocket(pollId, 'admin', { adminKey, enabled: Boolean(adminKey), onMessage: handleMessage });
-
-  // 실시간 경과 시간 표시용 1초 tick
-  useEffect(() => {
-    const id = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(id);
-  }, []);
 
   // selectedQuestionId 기본값/정리
   useEffect(() => {
@@ -301,7 +287,6 @@ export default function Admin() {
           <h1 className="text-lg font-bold">{view.poll?.title ?? '불러오는 중…'}</h1>
           <StatusChipRow
             presence={presence}
-            elapsed={formatElapsed(now - (view.poll?.createdAt ?? now))}
             activeLabel={activeIndex >= 0 ? `${activeIndex + 1} / ${view.questions.length}` : `- / ${view.questions.length}`}
             responseTotal={aggregateTotal(activeAggregate)}
           />
@@ -457,11 +442,10 @@ function aggregateTotal(agg?: Aggregate): number {
 // Header status chips
 // ---------------------------------------------------------------------------
 
-function StatusChipRow(props: { presence: number; elapsed: string; activeLabel: string; responseTotal: number }) {
+function StatusChipRow(props: { presence: number; activeLabel: string; responseTotal: number }) {
   const items = [
     { label: '참여자', value: props.presence, Icon: UsersRound },
     { label: '현재 응답', value: props.responseTotal, Icon: MessageCircleMore },
-    { label: '설문 경과', value: props.elapsed, Icon: Clock3 },
     { label: '활성 문항', value: props.activeLabel, Icon: ListChecks },
   ];
   return (
