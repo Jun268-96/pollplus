@@ -83,11 +83,18 @@ export default function Participate() {
     (question?.submissionMode === 'single' && submitState === 'done') ||
     (question?.submissionMode === 'multiple' && submissionCount >= question.maxSubmissions);
 
-  const submitChoice = (optionId: string) => {
+  const selectChoice = (optionId: string) => {
     if (!question || locked) return;
     setChoice(optionId);
+    setSubmitState('idle');
+    setAckReason(undefined);
+    setQuizFeedback(null);
+  };
+
+  const submitSelectedChoice = () => {
+    if (!question || !choice || locked) return;
     setSubmitState('sending');
-    send({ type: 'submit', questionId: question.id, payload: { kind: 'choice', optionId } });
+    send({ type: 'submit', questionId: question.id, payload: { kind: 'choice', optionId: choice } });
   };
 
   const submitText = () => {
@@ -154,7 +161,8 @@ export default function Participate() {
             ackReason={ackReason}
             quizFeedback={quizFeedback}
             submissionCount={submissionCount}
-            onSubmitChoice={submitChoice}
+            onSelectChoice={selectChoice}
+            onSubmitChoice={submitSelectedChoice}
             onSubmitText={submitText}
             onTextKeyDown={handleTextKeyDown}
           />
@@ -189,11 +197,12 @@ function QuestionBody(props: {
   ackReason?: string;
   quizFeedback: { correct: boolean; correctOptionId: string } | null;
   submissionCount: number;
-  onSubmitChoice: (optionId: string) => void;
+  onSelectChoice: (optionId: string) => void;
+  onSubmitChoice: () => void;
   onSubmitText: () => void;
   onTextKeyDown: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
 }) {
-  const { question, choice, text, setText, locked, submitState, ackReason, quizFeedback, submissionCount, onSubmitChoice, onSubmitText, onTextKeyDown } = props;
+  const { question, choice, text, setText, locked, submitState, ackReason, quizFeedback, submissionCount, onSelectChoice, onSubmitChoice, onSubmitText, onTextKeyDown } = props;
 
   return (
     <div className="flex flex-col gap-6">
@@ -218,7 +227,8 @@ function QuestionBody(props: {
                 key={opt.id}
                 type="button"
                 disabled={locked}
-                onClick={() => onSubmitChoice(opt.id)}
+                onClick={() => onSelectChoice(opt.id)}
+                aria-pressed={picked}
                 className={
                   'w-full rounded-full border px-5 py-3.5 text-center font-semibold transition-colors disabled:cursor-not-allowed ' +
                   (isCorrect
@@ -234,6 +244,14 @@ function QuestionBody(props: {
               </button>
             );
           })}
+          <button
+            type="button"
+            disabled={locked || !choice}
+            onClick={onSubmitChoice}
+            className="mt-1 w-full rounded-full bg-stage-accent px-5 py-3 font-semibold text-stage-accent-ink disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            제출하기
+          </button>
         </div>
       )}
 

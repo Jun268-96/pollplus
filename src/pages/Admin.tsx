@@ -132,6 +132,12 @@ export default function Admin() {
     send({ type: 'set_accepting', questionId: targetId, accepting: true });
   };
 
+  const stopQuestion = (questionId: string) => {
+    if (view.activeQuestionId !== questionId) return;
+    send({ type: 'set_accepting', questionId, accepting: false });
+    send({ type: 'set_active', questionId: null });
+  };
+
   const orderedIds = view.questions.map((q) => q.id);
   const activeIndex = view.activeQuestionId ? orderedIds.indexOf(view.activeQuestionId) : -1;
 
@@ -235,6 +241,7 @@ export default function Admin() {
             adding={adding}
             onSelect={setSelectedQuestionId}
             onStart={goToQuestion}
+            onStop={stopQuestion}
             onMove={moveQuestion}
             onDelete={deleteQuestion}
             onAddClick={() => setAdding(true)}
@@ -394,11 +401,12 @@ function QuestionSidebar(props: {
   adding: boolean;
   onSelect: (id: string) => void;
   onStart: (id: string) => void;
+  onStop: (id: string) => void;
   onMove: (id: string, dir: -1 | 1) => void;
   onDelete: (id: string) => void;
   onAddClick: () => void;
 }) {
-  const { questions, activeQuestionId, selectedQuestionId, adding, onSelect, onStart, onMove, onDelete, onAddClick } = props;
+  const { questions, activeQuestionId, selectedQuestionId, adding, onSelect, onStart, onStop, onMove, onDelete, onAddClick } = props;
 
   return (
     <div className="rounded-2xl border border-bento-border bg-bento-surface p-4 flex flex-col gap-1">
@@ -455,7 +463,18 @@ function QuestionSidebar(props: {
               </div>
             </div>
             <div className="flex flex-col items-end gap-0.5 shrink-0">
-              {!isActive && (
+              {isActive ? (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onStop(q.id);
+                  }}
+                  className="text-[10px] font-bold text-bento-bad hover:underline"
+                >
+                  ■ 멈춤
+                </button>
+              ) : (
                 <button
                   type="button"
                   onClick={(e) => {
