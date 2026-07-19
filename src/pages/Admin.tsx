@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
+import { Clock3, ListChecks, MessageCircleMore, UsersRound } from 'lucide-react';
 import { usePollSocket } from '../lib/usePollSocket';
 import { saveRecentPoll } from '../lib/recentPolls';
 import type {
@@ -295,9 +296,15 @@ export default function Admin() {
   return (
     <div className="min-h-full bg-bento-bg text-bento-ink">
       <header className="border-b border-bento-border px-6 py-4 flex flex-wrap items-center justify-between gap-3">
-        <div>
+        <div className="min-w-0">
           <p className="text-xs font-semibold uppercase tracking-wide text-bento-muted">PollPlus · 제작자</p>
           <h1 className="text-lg font-bold">{view.poll?.title ?? '불러오는 중…'}</h1>
+          <StatusChipRow
+            presence={presence}
+            elapsed={formatElapsed(now - (view.poll?.createdAt ?? now))}
+            activeLabel={activeIndex >= 0 ? `${activeIndex + 1} / ${view.questions.length}` : `- / ${view.questions.length}`}
+            responseTotal={aggregateTotal(activeAggregate)}
+          />
         </div>
         <div className="flex items-center gap-4 text-xs text-bento-muted">
           <span>{status === 'open' ? '🟢 연결됨' : '연결 중…'}</span>
@@ -312,13 +319,6 @@ export default function Admin() {
       )}
 
       <main className="p-6 flex flex-col gap-4">
-        <StatsStrip
-          presence={presence}
-          elapsed={formatElapsed(now - (view.poll?.createdAt ?? now))}
-          activeLabel={activeIndex >= 0 ? `${activeIndex + 1} / ${view.questions.length}` : `- / ${view.questions.length}`}
-          responseTotal={aggregateTotal(activeAggregate)}
-        />
-
         <div className="grid grid-cols-1 lg:grid-cols-[280px_1fr_260px] gap-4 items-start">
           <QuestionSidebar
             questions={view.questions}
@@ -454,22 +454,23 @@ function aggregateTotal(agg?: Aggregate): number {
 }
 
 // ---------------------------------------------------------------------------
-// Stats strip
+// Header status chips
 // ---------------------------------------------------------------------------
 
-function StatsStrip(props: { presence: number; elapsed: string; activeLabel: string; responseTotal: number }) {
+function StatusChipRow(props: { presence: number; elapsed: string; activeLabel: string; responseTotal: number }) {
   const items = [
-    { label: '참여자', value: props.presence },
-    { label: '현재 문항 응답', value: props.responseTotal },
-    { label: '진행 시간', value: props.elapsed },
-    { label: '활성 문항', value: props.activeLabel },
+    { label: '참여자', value: props.presence, Icon: UsersRound },
+    { label: '현재 응답', value: props.responseTotal, Icon: MessageCircleMore },
+    { label: '설문 경과', value: props.elapsed, Icon: Clock3 },
+    { label: '활성 문항', value: props.activeLabel, Icon: ListChecks },
   ];
   return (
-    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+    <div className="mt-3 flex flex-wrap items-center gap-2">
       {items.map((it) => (
-        <div key={it.label} className="rounded-xl border border-bento-border bg-bento-surface px-4 py-3">
-          <span className="block text-xs text-bento-muted mb-1">{it.label}</span>
-          <b className="text-xl tracking-tight">{it.value}</b>
+        <div key={it.label} className="inline-flex h-8 items-center gap-1.5 rounded-full border border-bento-border bg-bento-surface px-2.5 text-xs shadow-sm">
+          <it.Icon aria-hidden="true" size={14} strokeWidth={2} className="text-bento-muted" />
+          <span className="text-bento-muted">{it.label}</span>
+          <b className="font-mono text-bento-ink">{it.value}</b>
         </div>
       ))}
     </div>

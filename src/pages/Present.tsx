@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
+import { ChevronLeft, ChevronRight, Expand, X } from 'lucide-react';
 import { usePollSocket } from '../lib/usePollSocket';
 import type { PublicQuestion, ResponsePublicationState, ServerMessage, ViewerAggregate } from '../../shared/types';
 
@@ -164,7 +165,7 @@ function ResultsView(props: {
   if (aggregate.type === 'hidden') return <div className="mt-10 rounded-3xl border border-dashed border-bento-border bg-bento-surface/70 px-8 py-10 text-center text-2xl font-bold">결과는 잠시 후 공개돼요</div>;
   if ((aggregate.type === 'multiple_choice' || aggregate.type === 'quiz') && 'options' in question) return <ChoiceRace question={question} aggregate={aggregate} />;
   if (aggregate.type === 'word_cloud') return <WordField words={aggregate.words} total={aggregate.total} controller={controller} onCommand={onCommand} />;
-  if (aggregate.type === 'open_text') return <ResponseWall items={aggregate.items} total={aggregate.total} controller={controller} onCommand={onCommand} />;
+  if (aggregate.type === 'open_text') return <ResponseWall prompt={question.prompt} items={aggregate.items} total={aggregate.total} controller={controller} onCommand={onCommand} />;
   return null;
 }
 
@@ -224,30 +225,153 @@ function WordField(props: {
   );
 }
 
+const RESPONSE_SLIDE_LENGTH = 170;
+
+function responseSlides(text: string): string[] {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) return [''];
+
+  const sentences = normalized.match(/[^.!?…]+[.!?…]*|.+$/g) ?? [normalized];
+  const slides: string[] = [];
+  let current = '';
+
+  const addLongSentence = (sentence: string) => {
+    const characters = Array.from(sentence.trim());
+    while (characters.length) slides.push(characters.splice(0, RESPONSE_SLIDE_LENGTH).join('').trim());
+  };
+
+  for (const rawSentence of sentences) {
+    const sentence = rawSentence.trim();
+    if (!sentence) continue;
+    if (Array.from(sentence).length > RESPONSE_SLIDE_LENGTH) {
+      if (current) slides.push(current);
+      current = '';
+      addLongSentence(sentence);
+      continue;
+    }
+    const candidate = current ? `${current} ${sentence}` : sentence;
+    if (Array.from(candidate).length > RESPONSE_SLIDE_LENGTH) {
+      if (current) slides.push(current);
+      current = sentence;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) slides.push(current);
+  return slides.length ? slides : [normalized];
+}
+
 function ResponseWall(props: {
+  prompt: string;
   items: { text: string }[];
   total: number;
   controller: TvControllerState | null;
   onCommand: (action: ControllerAction, options?: { responseId?: string; state?: ResponsePublicationState }) => void;
 }) {
-  const { items, total, controller, onCommand } = props;
+  const { prompt, items, total, controller, onCommand } = props;
+  const [spotlight, setSpotlight] = useState<{ responseIndex: number; slideIndex: number; text: string } | null>(null);
   const visibleItems = items.slice(-6);
   const firstIndex = Math.max(0, items.length - visibleItems.length);
+
+  const closeSpotlight = useCallback(() => setSpotlight(null), []);
+  const moveSpotlight = useCallback(
+    (direction: -1 | 1) => {
+      setSpotlight((current) => {
+        if (!current) return current;
+        const slides = responseSlides(current.text);
+        if (direction === 1 && current.slideIndex < slides.length - 1) return { ...current, slideIndex: current.slideIndex + 1 };
+        if (direction === -1 && current.slideIndex > 0) return { ...current, slideIndex: current.slideIndex - 1 };
+
+        const nextIndex = current.responseIndex + direction;
+        const nextItem = items[nextIndex];
+        if (!nextItem) return current;
+        const nextSlides = responseSlides(nextItem.text);
+        return { responseIndex: nextIndex, text: nextItem.text, slideIndex: direction === 1 ? 0 : nextSlides.length - 1 };
+      });
+    },
+    [items],
+  );
+
+  useEffect(() => {
+    if (spotlight && items[spotlight.responseIndex]?.text !== spotlight.text) closeSpotlight();
+  }, [closeSpotlight, items, spotlight]);
+
+  useEffect(() => {
+    if (!spotlight) return;
+    const handleKeydown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeSpotlight();
+      if (event.key === 'ArrowLeft') moveSpotlight(-1);
+      if (event.key === 'ArrowRight') moveSpotlight(1);
+    };
+    window.addEventListener('keydown', handleKeydown);
+    return () => window.removeEventListener('keydown', handleKeydown);
+  }, [closeSpotlight, moveSpotlight, spotlight]);
+
   if (!items.length) {
     return <EmptyResults total={total} label={total > 0 ? '응답이 도착했고, 교사가 검토 중이에요' : '아직 응답이 없어요'} />;
   }
   return (
-    <div className="mt-10 grid w-full max-w-6xl grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-      {visibleItems.map((item, index) => {
-        const responseId = controller?.moderation[firstIndex + index]?.id;
-        return (
-          <article key={`${item.text}-${firstIndex + index}`} className="presentation-card group relative flex min-h-32 items-center rounded-3xl border border-bento-border bg-bento-surface p-5 text-left shadow-sm sm:min-h-40 sm:p-6">
-            <p className="text-xl font-bold leading-snug sm:text-2xl">{item.text}</p>
-            {controller && responseId && <button type="button" onClick={() => onCommand('set_response_state', { responseId, state: 'hidden' })} className="absolute right-3 top-3 hidden rounded-full border border-bento-bad bg-bento-surface px-2 py-1 text-[10px] font-bold text-bento-bad group-hover:block">송출에서 숨김</button>}
-          </article>
-        );
-      })}
-    </div>
+    <>
+      <div className="mt-10 grid w-full max-w-6xl grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+        {visibleItems.map((item, index) => {
+          const responseIndex = firstIndex + index;
+          const responseId = controller?.moderation[responseIndex]?.id;
+          return (
+            <article key={`${item.text}-${responseIndex}`} className="presentation-card group relative min-h-40 overflow-hidden rounded-3xl border border-bento-border bg-bento-surface text-left shadow-sm sm:min-h-48">
+              <button
+                type="button"
+                onClick={() => setSpotlight({ responseIndex, slideIndex: 0, text: item.text })}
+                className="flex h-full min-h-40 w-full flex-col justify-between p-5 text-left outline-none transition-colors hover:bg-bento-accent-soft/45 focus-visible:ring-4 focus-visible:ring-bento-accent/30 sm:min-h-48 sm:p-6"
+                aria-label="응답 전체 보기"
+              >
+                <p className="response-preview text-xl font-bold leading-snug sm:text-2xl">{item.text}</p>
+                <span className="mt-4 inline-flex items-center gap-1 self-end text-xs font-bold text-bento-accent"><Expand aria-hidden="true" size={14} /> 전체 보기</span>
+              </button>
+              {controller && responseId && <button type="button" onClick={() => onCommand('set_response_state', { responseId, state: 'hidden' })} className="absolute right-3 top-3 hidden rounded-full border border-bento-bad bg-bento-surface px-2 py-1 text-[10px] font-bold text-bento-bad shadow-sm group-hover:block group-focus-within:block">송출에서 숨김</button>}
+            </article>
+          );
+        })}
+      </div>
+      {spotlight && <ResponseSpotlight prompt={prompt} items={items} spotlight={spotlight} onClose={closeSpotlight} onMove={moveSpotlight} />}
+    </>
+  );
+}
+
+function ResponseSpotlight(props: {
+  prompt: string;
+  items: { text: string }[];
+  spotlight: { responseIndex: number; slideIndex: number; text: string };
+  onClose: () => void;
+  onMove: (direction: -1 | 1) => void;
+}) {
+  const { prompt, items, spotlight, onClose, onMove } = props;
+  const slides = responseSlides(spotlight.text);
+  const hasPrevious = spotlight.responseIndex > 0 || spotlight.slideIndex > 0;
+  const hasNext = spotlight.responseIndex < items.length - 1 || spotlight.slideIndex < slides.length - 1;
+  return (
+    <section className="fixed inset-0 z-30 flex min-h-full flex-col bg-bento-bg px-6 py-6 text-bento-ink sm:px-10 sm:py-8" role="dialog" aria-modal="true" aria-label="응답 발표 보기">
+      <div className="pointer-events-none absolute -left-24 top-1/4 h-72 w-72 rounded-full bg-bento-accent-soft blur-3xl" />
+      <div className="pointer-events-none absolute -right-32 bottom-0 h-96 w-96 rounded-full bg-bento-accent-soft/70 blur-3xl" />
+      <header className="relative flex items-start justify-between gap-5">
+        <div className="min-w-0">
+          <p className="font-mono text-xs font-bold tracking-[0.16em] text-bento-accent">RESPONSE SPOTLIGHT</p>
+          <p className="mt-2 max-w-3xl truncate text-sm font-semibold text-bento-muted sm:text-base">{prompt}</p>
+        </div>
+        <button type="button" onClick={onClose} className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-bento-border bg-bento-surface px-3 py-2 text-xs font-bold shadow-sm hover:bg-bento-accent-soft focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-bento-accent/30">
+          <X aria-hidden="true" size={16} /> 목록으로
+        </button>
+      </header>
+      <div className="relative mx-auto flex w-full max-w-5xl flex-1 items-center justify-center py-10">
+        <p className="max-h-[62vh] overflow-y-auto text-center text-3xl font-black leading-[1.35] tracking-tight sm:text-5xl lg:text-6xl">{slides[spotlight.slideIndex]}</p>
+      </div>
+      <footer className="relative flex flex-wrap items-center justify-between gap-3 border-t border-bento-border pt-4">
+        <span className="font-mono text-xs font-bold text-bento-muted">응답 {spotlight.responseIndex + 1} / {items.length} · {spotlight.slideIndex + 1} / {slides.length}</span>
+        <div className="flex items-center gap-2">
+          <button type="button" onClick={() => onMove(-1)} disabled={!hasPrevious} className="inline-flex items-center gap-1 rounded-xl border border-bento-border bg-bento-surface px-3 py-2 text-sm font-bold disabled:opacity-30"><ChevronLeft aria-hidden="true" size={17} /> 이전</button>
+          <button type="button" onClick={() => onMove(1)} disabled={!hasNext} className="inline-flex items-center gap-1 rounded-xl bg-bento-accent px-3 py-2 text-sm font-bold text-white disabled:opacity-30">다음 <ChevronRight aria-hidden="true" size={17} /></button>
+        </div>
+      </footer>
+    </section>
   );
 }
 
