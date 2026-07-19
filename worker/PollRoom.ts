@@ -11,6 +11,7 @@ import type {
   Role,
   ServerMessage,
   PublicStateMessage,
+  ViewerAggregate,
 } from '../shared/types';
 import { toPublicQuestion } from '../shared/types';
 import type { Env } from './env';
@@ -73,6 +74,114 @@ interface SocketAttachment {
   role: Role;
   socketTag: string;
   answered: Record<string, boolean>;
+}
+
+const MAX_QUESTIONS = 100;
+const MAX_ID_LENGTH = 128;
+const MAX_PROMPT_LENGTH = 1_000;
+const MAX_OPTION_TEXT_LENGTH = 200;
+const MAX_OPTIONS = 10;
+const MAX_RESPONSE_TEXT_LENGTH = 1_000;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isId(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0 && value.length <= MAX_ID_LENGTH;
+}
+
+function isText(value: unknown, maxLength: number): value is string {
+  return typeof value === 'string' && value.trim().length > 0 && value.length <= maxLength;
+}
+
+function isOptions(value: unknown): value is QuestionOption[] {
+  return (
+    Array.isArray(value) &&
+    value.length >= 2 &&
+    value.length <= MAX_OPTIONS &&
+    value.every((option) => isRecord(option) && isId(option.id) && isText(option.text, MAX_OPTION_TEXT_LENGTH)) &&
+    new Set(value.map((option) => option.id)).size === value.length
+  );
+}
+
+/** TypeScript 타입은 네트워크 입력을 검증하지 않는다. 모든 WS 메시지는 여기서 좁힌다. */
+function parseClientMessage(value: unknown): ClientMessage | null {
+  if (!isRecord(value) || typeof value.type !== 'string') return null;
+
+  switch (value.type) {
+    case 'submit': {
+      if (!isId(value.questionId) || !isRecord(value.payload)) return null;
+      if (value.payload.kind === 'choice' && isId(value.payload.optionId)) {
+        return { type: 'submit', questionId: value.questionId, payload: { kind: 'choice', optionId: value.payload.optionId } };
+      }
+      if (value.payload.kind === 'text' && isText(value.payload.text, MAX_RESPONSE_TEXT_LENGTH)) {
+        return { type: 'submit', questionId: value.questionId, payload: { kind: 'text', text: value.payload.text.trim() } };
+      }
+      return null;
+    }
+    case 'add_question': {
+      if (!isRecord(value.input)) return null;
+      const input = value.input;
+      if (!isText(input.prompt, MAX_PROMPT_LENGTH)) return null;
+      const { type, prompt } = input;
+      if (type === 'open_text' || type === 'word_cloud') return { type: 'add_question', input: { type, prompt: prompt.trim() } };
+      if ((type === 'multiple_choice' || type === 'quiz') && isOptions(input.options)) {
+        if (type === 'quiz' && (!isId(input.correctOptionId) || !input.options.some((o) => o.id === input.correctOptionId))) return null;
+        return {
+          type: 'add_question',
+          input: {
+            type,
+            prompt: prompt.trim(),
+            options: input.options,
+            ...(type === 'quiz' ? { correctOptionId: input.correctOptionId as string } : {}),
+          },
+        };
+      }
+      return null;
+    }
+    case 'update_question': {
+      if (!isId(value.questionId) || !isRecord(value.patch)) return null;
+      const patch: QuestionPatch = {};
+      if ('prompt' in value.patch) {
+        if (!isText(value.patch.prompt, MAX_PROMPT_LENGTH)) return null;
+        patch.prompt = value.patch.prompt.trim();
+      }
+      if ('options' in value.patch) {
+        if (!isOptions(value.patch.options)) return null;
+        patch.options = value.patch.options;
+      }
+      if ('correctOptionId' in value.patch) {
+        if (!isId(value.patch.correctOptionId)) return null;
+        patch.correctOptionId = value.patch.correctOptionId;
+      }
+      if (Object.keys(patch).length === 0) return null;
+      return { type: 'update_question', questionId: value.questionId, patch };
+    }
+    case 'delete_question':
+    case 'hide_response':
+      return isId(value[value.type === 'delete_question' ? 'questionId' : 'responseId'])
+        ? (value.type === 'delete_question'
+          ? { type: 'delete_question', questionId: value.questionId as string }
+          : { type: 'hide_response', responseId: value.responseId as string })
+        : null;
+    case 'reorder_questions':
+      return Array.isArray(value.questionIds) && value.questionIds.length <= MAX_QUESTIONS && value.questionIds.every(isId)
+        ? { type: 'reorder_questions', questionIds: value.questionIds }
+        : null;
+    case 'set_active':
+      return value.questionId === null || isId(value.questionId) ? { type: 'set_active', questionId: value.questionId } : null;
+    case 'set_accepting':
+      return isId(value.questionId) && typeof value.accepting === 'boolean'
+        ? { type: 'set_accepting', questionId: value.questionId, accepting: value.accepting }
+        : null;
+    case 'set_results_visible':
+      return isId(value.questionId) && typeof value.visible === 'boolean'
+        ? { type: 'set_results_visible', questionId: value.questionId, visible: value.visible }
+        : null;
+    default:
+      return null;
+  }
 }
 
 export class PollRoom extends DurableObject<Env> {
@@ -140,7 +249,9 @@ export class PollRoom extends DurableObject<Env> {
 
     const url = new URL(request.url);
     const role = url.searchParams.get('role');
-    const key = url.searchParams.get('key');
+    const offeredProtocols = request.headers.get('Sec-WebSocket-Protocol')?.split(',').map((value) => value.trim()) ?? [];
+    const adminProtocol = offeredProtocols.find((value) => value.startsWith('pollplus-admin.'));
+    const key = adminProtocol?.slice('pollplus-admin.'.length) ?? null;
 
     if (role !== 'admin' && role !== 'participant' && role !== 'viewer') {
       return new Response('invalid role', { status: 400 });
@@ -170,7 +281,11 @@ export class PollRoom extends DurableObject<Env> {
     this.sendActiveResultsOnConnect(server, role);
     if (role === 'participant') this.broadcastPresence();
 
-    return new Response(null, { status: 101, webSocket: client });
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+      ...(role === 'admin' && adminProtocol ? { headers: { 'Sec-WebSocket-Protocol': adminProtocol } } : {}),
+    });
   }
 
   // ---------------------------------------------------------------------
@@ -180,12 +295,14 @@ export class PollRoom extends DurableObject<Env> {
   async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
     if (typeof message !== 'string') return;
 
-    let parsed: ClientMessage;
+    let value: unknown;
     try {
-      parsed = JSON.parse(message);
+      value = JSON.parse(message);
     } catch {
       return;
     }
+    const parsed = parseClientMessage(value);
+    if (!parsed) return;
 
     const attachment = ws.deserializeAttachment() as SocketAttachment | null;
     if (!attachment) return;
@@ -201,7 +318,7 @@ export class PollRoom extends DurableObject<Env> {
 
     switch (parsed.type) {
       case 'add_question':
-        this.handleAddQuestion(parsed.input);
+        this.handleAddQuestion(ws, parsed.input);
         break;
       case 'update_question':
         this.handleUpdateQuestion(ws, parsed.questionId, parsed.patch);
@@ -210,7 +327,7 @@ export class PollRoom extends DurableObject<Env> {
         this.handleDeleteQuestion(ws, parsed.questionId);
         break;
       case 'reorder_questions':
-        this.handleReorder(parsed.questionIds);
+        this.handleReorder(ws, parsed.questionIds);
         break;
       case 'set_active':
         this.handleSetActive(parsed.questionId);
@@ -241,7 +358,10 @@ export class PollRoom extends DurableObject<Env> {
   // 문항 CRUD 핸들러 (비활성 문항은 자유, 활성 문항은 구조 변경 거부)
   // ---------------------------------------------------------------------
 
-  private handleAddQuestion(input: NewQuestionInput) {
+  private handleAddQuestion(ws: WebSocket, input: NewQuestionInput) {
+    if (this.getQuestions().length >= MAX_QUESTIONS) {
+      return this.send(ws, { type: 'error', reason: `문항은 최대 ${MAX_QUESTIONS}개까지 만들 수 있습니다.` });
+    }
     const rows = this.ctx.storage.sql.exec<MaxPositionRow>('SELECT MAX(position) as maxPos FROM questions').toArray();
     const position = (rows[0]?.maxPos ?? -1) + 1;
     const id = crypto.randomUUID();
@@ -304,7 +424,11 @@ export class PollRoom extends DurableObject<Env> {
     this.broadcastAdminState();
   }
 
-  private handleReorder(questionIds: string[]) {
+  private handleReorder(ws: WebSocket, questionIds: string[]) {
+    const knownIds = this.getQuestions().map((question) => question.id);
+    if (questionIds.length !== knownIds.length || new Set(questionIds).size !== knownIds.length || questionIds.some((id) => !knownIds.includes(id))) {
+      return this.send(ws, { type: 'error', reason: '문항 순서 정보가 올바르지 않습니다.' });
+    }
     questionIds.forEach((id, index) => {
       this.ctx.storage.sql.exec('UPDATE questions SET position = ? WHERE id = ?', index, id);
     });
@@ -520,18 +644,6 @@ export class PollRoom extends DurableObject<Env> {
     return { type: 'word_cloud', words, items };
   }
 
-  private aggregateTotal(agg: Aggregate): number {
-    switch (agg.type) {
-      case 'multiple_choice':
-      case 'quiz':
-      case 'hidden':
-        return agg.total;
-      case 'open_text':
-      case 'word_cloud':
-        return agg.items.length;
-    }
-  }
-
   // ---------------------------------------------------------------------
   // 브로드캐스트 (역할별 fan-out — ctx.getWebSockets(tag)로 role 태깅된 소켓만 선택)
   // ---------------------------------------------------------------------
@@ -600,10 +712,26 @@ export class PollRoom extends DurableObject<Env> {
 
   private buildResultsMessages(question: AdminQuestion): { fullMsg: ServerMessage; viewerMsg: ServerMessage } {
     const aggregate = this.computeAggregate(question);
-    const total = this.aggregateTotal(aggregate);
     const fullMsg: ServerMessage = { type: 'results', questionId: question.id, aggregate };
-    const hiddenMsg: ServerMessage = { type: 'results', questionId: question.id, aggregate: { type: 'hidden', total } };
-    return { fullMsg, viewerMsg: question.resultsVisible ? fullMsg : hiddenMsg };
+    const viewerAggregate: ViewerAggregate = question.resultsVisible
+      ? this.toViewerAggregate(aggregate)
+      : { type: 'hidden' };
+    return { fullMsg, viewerMsg: { type: 'results', questionId: question.id, aggregate: viewerAggregate } };
+  }
+
+  /** 공개 TV에는 응답 원문·ID·시각을 전달하지 않는다. */
+  private toViewerAggregate(aggregate: Aggregate): ViewerAggregate {
+    switch (aggregate.type) {
+      case 'multiple_choice':
+      case 'quiz':
+        return aggregate;
+      case 'open_text':
+        return { type: 'open_text', total: aggregate.items.length };
+      case 'word_cloud':
+        return { type: 'word_cloud', total: aggregate.items.length, words: aggregate.words };
+      case 'hidden':
+        return { type: 'hidden' };
+    }
   }
 
   /** 새로 접속한 admin/viewer는 활성 문항의 "지금까지의" 집계를 즉시 받아야 한다 —

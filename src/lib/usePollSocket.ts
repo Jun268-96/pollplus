@@ -40,9 +40,9 @@ export function usePollSocket(pollId: string, role: Role, { adminKey, onMessage 
     const url = new URL(`/api/polls/${pollId}/ws`, window.location.href);
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
     url.searchParams.set('role', role);
-    if (adminKey) url.searchParams.set('key', adminKey);
-
-    const ws = new WebSocket(url);
+    // 관리자 키는 URL(브라우저 기록·referrer·접속 로그)에 남기지 않는다.
+    // 알파벳/숫자로 생성된 키를 WebSocket subprotocol로 전달하고 서버가 협상한다.
+    const ws = new WebSocket(url, adminKey ? `pollplus-admin.${adminKey}` : undefined);
     wsRef.current = ws;
 
     ws.onopen = () => {

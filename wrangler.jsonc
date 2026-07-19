@@ -3,6 +3,7 @@
   "name": "pollplus",
   "main": "worker/index.ts",
   "compatibility_date": "2026-07-19",
+  "compatibility_flags": ["global_fetch_strictly_public"],
 
   "durable_objects": {
     "bindings": [{ "name": "POLL_ROOM", "class_name": "PollRoom" }]

@@ -24,7 +24,9 @@ export default function CreatePoll() {
       });
       if (!res.ok) throw new Error('설문을 만들지 못했습니다');
       const data: CreatePollResponse = await res.json();
-      navigate(`/admin/${data.pollId}?k=${data.adminKey}`);
+      // fragment는 HTTP 요청·referrer에 포함되지 않는다. Admin 화면은 이를 즉시
+      // localStorage에 옮긴 뒤 주소 표시줄에서도 제거한다.
+      navigate(`/admin/${data.pollId}#k=${data.adminKey}`);
     } catch {
       setError('설문을 만들지 못했습니다. 잠시 후 다시 시도해주세요.');
       setSubmitting(false);

@@ -69,6 +69,14 @@ export type Aggregate =
   | { type: 'word_cloud'; words: { text: string; count: number }[]; items: ResponseItem[] }
   | { type: 'hidden'; total: number };
 
+/** 공개 TV(viewer) 전용 집계. 자유서술 원문·응답 ID·시각은 관리자에게만 전달한다. */
+export type ViewerAggregate =
+  | { type: 'multiple_choice'; total: number; counts: Record<string, number> }
+  | { type: 'quiz'; total: number; counts: Record<string, number>; correctOptionId: string }
+  | { type: 'open_text'; total: number }
+  | { type: 'word_cloud'; total: number; words: { text: string; count: number }[] }
+  | { type: 'hidden' };
+
 // ---------------------------------------------------------------------------
 // 문항 CRUD 입력
 // ---------------------------------------------------------------------------
@@ -134,7 +142,7 @@ export type StateMessage = AdminStateMessage | PublicStateMessage;
 
 export type ServerMessage =
   | StateMessage
-  | { type: 'results'; questionId: string; aggregate: Aggregate }
+  | { type: 'results'; questionId: string; aggregate: Aggregate | ViewerAggregate }
   | { type: 'presence'; participantCount: number }
   | {
       type: 'submit_ack';

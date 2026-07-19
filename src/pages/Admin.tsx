@@ -43,10 +43,13 @@ export default function Admin() {
   const { pollId = '' } = useParams();
 
   const [adminKey] = useState(() => {
-    const fromUrl = new URLSearchParams(window.location.search).get('k');
+    const fromQuery = new URLSearchParams(window.location.search).get('k');
+    const fromFragment = new URLSearchParams(window.location.hash.slice(1)).get('k');
+    const fromUrl = fromFragment ?? fromQuery;
     const storageKey = `pollplus:adminKey:${pollId}`;
     if (fromUrl) {
       localStorage.setItem(storageKey, fromUrl);
+      window.history.replaceState(null, '', window.location.pathname);
       return fromUrl;
     }
     return localStorage.getItem(storageKey) ?? '';
@@ -71,7 +74,8 @@ export default function Admin() {
       return;
     }
     if (msg.type === 'results') {
-      setResults((prev) => ({ ...prev, [msg.questionId]: msg.aggregate }));
+      // admin 소켓은 서버에서 항상 전체 Aggregate만 받는다.
+      setResults((prev) => ({ ...prev, [msg.questionId]: msg.aggregate as Aggregate }));
       return;
     }
     if (msg.type === 'error') {

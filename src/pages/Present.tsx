@@ -1,7 +1,7 @@
 import { useCallback, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { usePollSocket } from '../lib/usePollSocket';
-import type { Aggregate, PublicQuestion, ServerMessage } from '../../shared/types';
+import type { PublicQuestion, ServerMessage, ViewerAggregate } from '../../shared/types';
 
 interface ViewState {
   poll: { id: string; title: string; createdAt: number } | null;
@@ -13,7 +13,7 @@ export default function Present() {
 
   const [view, setView] = useState<ViewState>({ poll: null, activeQuestion: null });
   const [presence, setPresence] = useState(0);
-  const [resultsPair, setResultsPair] = useState<{ questionId: string; aggregate: Aggregate } | null>(null);
+  const [resultsPair, setResultsPair] = useState<{ questionId: string; aggregate: ViewerAggregate } | null>(null);
   const prevIdRef = useRef<string | null>(null);
 
   const handleMessage = useCallback((msg: ServerMessage) => {
@@ -31,7 +31,7 @@ export default function Present() {
       return;
     }
     if (msg.type === 'results') {
-      setResultsPair({ questionId: msg.questionId, aggregate: msg.aggregate });
+      setResultsPair({ questionId: msg.questionId, aggregate: msg.aggregate as ViewerAggregate });
     }
   }, []);
 
@@ -87,7 +87,7 @@ export default function Present() {
   );
 }
 
-function ResultsView(props: { question: PublicQuestion; aggregate?: Aggregate }) {
+function ResultsView(props: { question: PublicQuestion; aggregate?: ViewerAggregate }) {
   const { question, aggregate } = props;
 
   if (!aggregate) {
@@ -98,7 +98,6 @@ function ResultsView(props: { question: PublicQuestion; aggregate?: Aggregate })
     return (
       <div className="flex flex-col items-center gap-2">
         <p className="text-2xl">🙈 결과는 잠시 후 공개돼요</p>
-        <p className="text-bento-muted">{aggregate.total}명 응답함</p>
       </div>
     );
   }
@@ -149,16 +148,9 @@ function ResultsView(props: { question: PublicQuestion; aggregate?: Aggregate })
     );
   }
 
-  // open_text
-  if (aggregate.items.length === 0) return <p className="text-bento-muted">아직 응답이 없어요</p>;
-  const recent = [...aggregate.items].reverse().slice(0, 8);
+  // open_text — 원문은 moderation을 위한 admin 화면에만 전달한다.
+  if (aggregate.total === 0) return <p className="text-bento-muted">아직 응답이 없어요</p>;
   return (
-    <div className="flex flex-col gap-2 w-full max-w-xl">
-      {recent.map((item) => (
-        <div key={item.id} className="rounded-xl border border-bento-border bg-bento-surface px-4 py-3 text-lg text-left">
-          {item.text}
-        </div>
-      ))}
-    </div>
+    <p className="text-xl font-semibold text-bento-muted">{aggregate.total}개의 응답이 모였어요</p>
   );
 }

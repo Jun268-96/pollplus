@@ -34,15 +34,17 @@ export default {
 } satisfies ExportedHandler<Env>;
 
 async function handleCreatePoll(request: Request, env: Env): Promise<Response> {
-  let body: CreatePollRequest;
+  let body: unknown;
   try {
     body = await request.json();
   } catch {
     return new Response('invalid json', { status: 400 });
   }
 
-  const title = body.title?.trim();
-  if (!title) {
+  const rawTitle =
+    body !== null && typeof body === 'object' && 'title' in body ? (body as CreatePollRequest).title : undefined;
+  const title = typeof rawTitle === 'string' ? rawTitle.trim() : '';
+  if (!title || title.length > 120) {
     return new Response('title required', { status: 400 });
   }
 
