@@ -1,0 +1,41 @@
+@import "tailwindcss";
+
+@theme {
+  /* 벤토형 — 제작자(Admin)·TV(Present) */
+  --color-bento-bg: oklch(97% 0.004 250);
+  --color-bento-surface: oklch(100% 0 0);
+  --color-bento-border: oklch(90% 0.006 250);
+  --color-bento-ink: oklch(21% 0.01 250);
+  --color-bento-muted: oklch(50% 0.012 250);
+  --color-bento-accent: oklch(56% 0.15 254);
+  --color-bento-accent-soft: oklch(94% 0.03 254);
+  --color-bento-good: oklch(62% 0.14 152);
+  --color-bento-bad: oklch(58% 0.18 25);
+  --color-bento-bad-soft: oklch(95% 0.03 25);
+
+  /* 무대형 — 참여자(Participate) */
+  --color-stage-bg: oklch(14% 0.02 262);
+  --color-stage-ink: oklch(97% 0.008 90);
+  --color-stage-muted: oklch(58% 0.02 262);
+  --color-stage-accent: oklch(74% 0.17 55);
+  --color-stage-accent-ink: oklch(17% 0.03 55);
+  --color-stage-line: oklch(26% 0.02 262);
+
+  --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+
+* {
+  box-sizing: border-box;
+}

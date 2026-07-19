@@ -1,0 +1,21 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "pollplus",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-07-19",
+
+  "durable_objects": {
+    "bindings": [{ "name": "POLL_ROOM", "class_name": "PollRoom" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["PollRoom"] }],
+
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+
+  "observability": {
+    "enabled": true
+  }
+}
